@@ -157,7 +157,6 @@ $txtFileDWallTags = "tags_$prefix.allTags.dwar";
 $txtFileDWfilter = "tags_$prefix.filtered.dwar";
 $invalidFile = "tags_$prefix.invalid.txt";
 $chimFile = "tags_$prefix.chimeras.txt";
-$chimFileDW = "tags_$prefix.chimeras.dwar";
 $distFile = "tags_$prefix.$tags2focus.txt";
 $overTagsFile = "tags_$prefix.over.txt";
 $existingTagsFile = "tags_$prefix.existingtags.txt";
@@ -726,7 +725,7 @@ RECOVERY:
 		}
 		if ($chimera) {
 			$chimeraReads++ unless $recoverRead;
-			$chimeras{$match}++;
+			$chimeras{"$closingPrimerId;$match"}++;
 		} else {
 			if ($shorter) { $reducedReads++ unless $recoverRead; next }
 			if ($longer) { $longerReads++ unless $recoverRead; next unless $leftAnchored }
@@ -887,18 +886,13 @@ if ($printRecovery) {
 
 # print chimeras
 if ($chimeraReads and $printChimeras) {
-	open CHIMERAS, "| sort -k" . ($cycles + 1) . "rn >>$chimFile" or die "could not write $chimFile: $!";
-	foreach $match (keys %chimeras) {
-		$counts = $chimeras{$match};
-		print CHIMERAS "$match$counts\n";
+	open CHIMERAS, "| sort -k" . ($cycles + 2) . "rn >$chimFile" or die "could not write $chimFile: $!";
+	foreach $cpMatch (keys %chimeras) {
+		($closingPrimerID, $match) = split ";", $cpMatch;
+		print CHIMERAS "$match$closingPrimerID\t$chimeras{$cpMatch}\n";
 	}
 	close CHIMERAS;
-	unless ($threaded) {
-		writeFiles("$prefix.header", $chimFileDW, 0);
-		writeFiles($chimFile, $chimFileDW, 0);
-		writeFiles("$prefix.dwfooter", $chimFileDW, 1);
-	}
-	print STDERR "$chimFile\n$chimFileDW\n";
+	print STDERR "$chimFile\n";
 }
 
 # print raw tag counts

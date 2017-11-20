@@ -16,6 +16,10 @@ Repository files
   * tagFinder.config.ini contains the schematic format of the data the script requires
   * tagFinder.pl is the main script, to be run on any unix or linux machine
 
+Input: Fastq
+------------
+Raw gzipped or uncompressed [fastq](https://en.wikipedia.org/wiki/FASTQ_format) files can be processed right out from the sequencer. [seqtk](https://github.com/lh3/seqtk) library will be used if available for fast fastq format dissection.
+
 Output: Log file
 ----------------
 Not everything is detecting valid tags from valid reads. Instead, ``tagFinder`` is capable of disecting the input so that not only valid results are perfectly described, but also invalid results are throroughly inspected. It provides a much better understanding of the experiment, which is of great help specially when developing a new library or testing a new technology.

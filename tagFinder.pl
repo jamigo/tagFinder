@@ -134,6 +134,7 @@ if ($fastqFile =~ /([^\/]+)\.[fastq]+(\.gz)?(\.(\d+))?/i) {
 	die "could not find a valid prefix in $fastqFile";
 }
 
+$threaded = 0;
 if ($threads > 1) {
 	if ($fastqFile =~ /\.\d+$/) {
 		$threaded = 1;
@@ -170,9 +171,9 @@ $logFile = "tags_$prefix.log";
 
 $noFwAnchorTag = "";
 
-$tagsOverHeader = "\tSDCOUNT_RAW\tSDCOUNT_DEDUP";
-$tagsOverTabBlanks = "";
 if ($printOver) {
+	$tagsOverHeader = "\tSDCOUNT_RAW\tSDCOUNT_DEDUP";
+	$tagsOverTabBlanks = "\t0\t0";
 	@tagsOverTypes = ("raw", "dedup", "unique");
 	@overStrings = ("LINES", "PLANES");
 	foreach $overString (@overStrings) {
@@ -181,6 +182,9 @@ if ($printOver) {
 			$tagsOverTabBlanks .= "\t0";
 		}
 	}
+} else {
+	$tagsOverHeader = "";
+	$tagsOverTabBlanks = "";
 }
 
 # read config file
@@ -758,7 +762,7 @@ RECOVERY:
 							($seq4degen = reverse substr($seq, 0, $tagPosMatch)) =~ tr/ACGT/TGCA/;
 						}
 						if ($seq4degen =~ $regexN) {
-							$indexMatches{$cpMatch}{dedups}{$1}++;
+							$cpMatchesDedupStrings{$cpMatch} .= "$1;";
 							$degenCounts{$closingPrimerId}{$1}++ if $printDegen;
 						} else {
 							$undedupReads++ unless $recoverRead;
@@ -769,11 +773,11 @@ RECOVERY:
 				} else {
 					$cpMatch = "$noFwAnchorTag;$match";
 				}
-				$indexMatches{$cpMatch}{count}++;
+				$cpMatchesCounts{$cpMatch}++;
 				if ($forward) {
-					$indexMatches{$cpMatch}{strand}++;
+					$cpMatchesStrand{$cpMatch}++;
 				} else {
-					$indexMatches{$cpMatch}{strand}--;
+					$cpMatchesStrand{$cpMatch}--;
 				}
 			} else {
 				$unfoundReads++ unless $recoverRead;
@@ -818,9 +822,6 @@ if ($cleanDegen) {
 		}
 	}
 }
-
-# get headers and footer
-printHeaderFooter($prefix, $cycles) unless $threaded;
 
 # deal with tag lengths
 $maxLengthCount = 0;
@@ -919,11 +920,12 @@ if ($matchedReads and $tags2focus and $detectDegen) {
 	open DIST, "| sort -k3nr >$distFile" or die "could not write $distFile: $!";
 	foreach $closingPrimerId (sort keys %matchedCPreads) {
 		$cpString = "$closingPrimerId;$tags2focusString";
-		if ( exists $indexMatches{$cpString} ) {
-			if ( exists $indexMatches{$cpString}{dedups} ) {
-				foreach $degenSeq ( keys %{ $indexMatches{$cpString}{dedups} } ) {
-					print DIST "$closingPrimerId\t$degenSeq\t$indexMatches{$cpString}{dedups}{$degenSeq}\n";
-				}
+		if ( $degenSeqs = $cpMatchesDedupStrings{$cpString} ) {
+			chop $degenSeqs;
+			%degenSeqsHash = ();
+			foreach $degenSeq (split ";", $degenSeqs) { $degenSeqsHash{$degenSeq}++ }
+			foreach $degenSeq (keys %degenSeqsHash) {
+				print DIST "$closingPrimerId\t$degenSeq\t$degenSeqsHash{$degenSeq}\n";
 			}
 		}
 	}
@@ -932,34 +934,41 @@ if ($matchedReads and $tags2focus and $detectDegen) {
 }
 
 # get the number of compounds
-$cpMatchesCount = keys %indexMatches;
+$cpMatchesCount = keys %cpMatchesCounts;
 
-# look for overrepresented tags
+# look for overrepresented tags and clean degen
 if ($matchedReads) {
-	foreach $cpMatch (keys %indexMatches) {
-		$dedupCount = scalar keys %{ $indexMatches{$cpMatch}{dedups} };
-		$dedupCount = 1 unless $dedupCount;
-		if ($cleanDegen and $dedupCount > 1 and $dedupCount < 10000) {
-			@degenSeqs = sort { $indexMatches{$cpMatch}{dedups}{$b} <=> $indexMatches{$cpMatch}{dedups}{$a} or $a cmp $b } keys %{ $indexMatches{$cpMatch}{dedups} };
-			@degenSeqsRev = reverse @degenSeqs;
-			pop @degenSeqs;
-			pop @degenSeqsRev;
-			%degenSeqsRemoved = ();
-			foreach $degenSeq1 (@degenSeqs) {
-				unless ( exists $degenSeqsRemoved{$degenSeq1} ) {
-					$degenSeqLength1 = length $degenSeq1;
-					if ($degenSeqLength1 > $maxDegenErrors) {
-						for $degenError (1..$maxDegenErrors) {
-							if ( exists $beginningSeqsBaseErrors{$degenError} ) {
-								$degenSeqErrorProb = $indexMatches{$cpMatch}{dedups}{$degenSeq1} * $degenSeqLength1 * $beginningSeqsBaseErrors{$degenError};
-								foreach $degenSeq2 (@degenSeqsRev) {
-									unless ( exists $degenSeqsRemoved{$degenSeq2} ) {
-										if ($indexMatches{$cpMatch}{dedups}{$degenSeq2} < $degenSeqErrorProb) {
-											if (minSeqLD($degenSeq1, $degenSeqLength1, $degenSeq2, length $degenSeq2, $degenError) <= $degenError) {
-												$degenSeqsRemoved{$degenSeq2} = 1;
-												$dedupCount--;
+	foreach $cpMatch (keys %cpMatchesCounts) {
+		$dedupCount = 1;
+		if ($cleanDegen) {
+			if ( $degenSeqs = $cpMatchesDedupStrings{$cpMatch} ) {
+				chop $degenSeqs;
+				%degenSeqsHash = ();
+				foreach $degenSeq (split ";", $degenSeqs) { $degenSeqsHash{$degenSeq}++ }
+				$dedupCount = keys %degenSeqsHash;
+				if ($dedupCount < 10000) {
+					@degenSeqsArray = sort { $degenSeqsHash{$b} <=> $degenSeqsHash{$a} or $a cmp $b } keys %degenSeqsHash;
+					@degenSeqsRev = reverse @degenSeqsArray;
+					pop @degenSeqsArray;
+					pop @degenSeqsRev;
+					%degenSeqsRemoved = ();
+					foreach $degenSeq1 (@degenSeqsArray) {
+						unless ( exists $degenSeqsRemoved{$degenSeq1} ) {
+							$degenSeqLength1 = length $degenSeq1;
+							if ($degenSeqLength1 > $maxDegenErrors) {
+								for $degenError (1..$maxDegenErrors) {
+									if ( exists $beginningSeqsBaseErrors{$degenError} ) {
+										$degenSeqErrorProb = $degenSeqsHash{$degenSeq1} * $degenSeqLength1 * $beginningSeqsBaseErrors{$degenError};
+										foreach $degenSeq2 (@degenSeqsRev) {
+											unless ( exists $degenSeqsRemoved{$degenSeq2} ) {
+												if ($degenSeqsHash{$degenSeq2} < $degenSeqErrorProb) {
+													if (minSeqLD($degenSeq1, $degenSeqLength1, $degenSeq2, length $degenSeq2, $degenError) <= $degenError) {
+														$degenSeqsRemoved{$degenSeq2} = 1;
+														$dedupCount--;
+													}
+												} else { last }
 											}
-										} else { last }
+										}
 									}
 								}
 							}
@@ -968,9 +977,8 @@ if ($matchedReads) {
 				}
 			}
 		}
-		delete $indexMatches{$cpMatch}{dedups} unless $threaded;
-		$indexMatches{$cpMatch}{dedup} = $dedupCount;
-		$matchCount = $indexMatches{$cpMatch}{count};
+		$matchCount = $cpMatchesCounts{$cpMatch};
+		$cpMatchesDedups{$cpMatch} = $dedupCount;
 		($closingPrimerId, $match) = split ";", $cpMatch;
 		if ($printOver) {
 			$countsUniq{$closingPrimerId}++;
@@ -994,6 +1002,7 @@ if ($matchedReads) {
 			}
 		}
 	}
+	undef %cpMatchesDedupStrings unless $threaded;
 	if ($printOver) {
 		foreach $closingPrimerId (keys %tagsFound) {
 			foreach $type ("raw", "dedup") {
@@ -1001,10 +1010,10 @@ if ($matchedReads) {
 				$tempAverage{$closingPrimerId}{$type} = $countsAverage{$closingPrimerId}{$type};
 			}
 		}
-		foreach $cpMatch (keys %indexMatches) {
+		foreach $cpMatch (keys %cpMatchesCounts) {
 			($closingPrimerId, $match) = split ";", $cpMatch;
-			$matchCount = $indexMatches{$cpMatch}{count};
-			$dedupCount = $indexMatches{$cpMatch}{dedup};
+			$matchCount = $cpMatchesCounts{$cpMatch};
+			$dedupCount = $cpMatchesDedups{$cpMatch};
 			foreach $type ("raw", "dedup") {
 				if ($type eq "raw") { $tempValue = $matchCount } else { $tempValue = $dedupCount }
 				$tempStdDev{$closingPrimerId}{$type} += ( $tempAverage{$closingPrimerId}{$type} - $tempValue ) ** 2;
@@ -1060,10 +1069,10 @@ if ($matchedReads) {
 				}
 			}
 		}
-		foreach $cpMatch (keys %indexMatches) {
+		foreach $cpMatch (keys %cpMatchesCounts) {
 			($closingPrimerId, $match) = split ";", $cpMatch;
-			$matchCount = $indexMatches{$cpMatch}{count};
-			$dedupCount = $indexMatches{$cpMatch}{dedup};
+			$matchCount = $cpMatchesCounts{$cpMatch};
+			$dedupCount = $cpMatchesDedups{$cpMatch};
 			$sdString = "";
 			foreach $type ("raw", "dedup") {
 				if ($type eq "raw") {
@@ -1080,7 +1089,7 @@ if ($matchedReads) {
 					print OVER "$type\t$tempValue\t$tempCount\t$closingPrimerId\t$match\n";
 				}
 			}
-			$indexMatches{$cpMatch}{sd} = $sdString;
+			$cpMatchesSD{$cpMatch} = $sdString;
 		}
 		close OVER;
 		if ($cpMatchesCount < $outSortLimit) {
@@ -1119,7 +1128,7 @@ if ($matchedReads and $checkValidTags) {
 	if ($tagsMissingCount > $tagsFoundCount) { $filterMatches = 1 }
 	if ($printExpected) {
 		close EXPECTED;
-		open EXPECTED, ">$expectedFile.sortTemp" or die "could not open $expectedFile.sortTemp: $!";
+		open EXPECTED, ">$expectedFile.temp" or die "could not open $expectedFile.temp: $!";
 		print EXPECTED "ID\tTAG";
 		foreach $closingPrimerId (sort keys %matchedCPreads) {
 			$closingPrimerHeader = $closingPrimerId ? $closingPrimerId : "EMPTY";
@@ -1128,20 +1137,36 @@ if ($matchedReads and $checkValidTags) {
 		print EXPECTED "\n";
 		close EXPECTED;
 		if ($cpMatchesCount < $outSortLimit) {
-			system "sort -k1n $expectedFile >> $expectedFile.sortTemp";
+			system "sort -k1n $expectedFile >> $expectedFile.temp";
+			rename "$expectedFile.temp", $expectedFile;
 		} else {
-			writeFiles($expectedFile, "$expectedFile.sortTemp", 1);
+			system "cat $expectedFile.temp $expectedFile > $expectedFile.temp2";
+			rename "$expectedFile.temp2", $expectedFile;
+			unlink "$expectedFile.temp";
 		}
-		rename "$expectedFile.sortTemp", $expectedFile;
 		print STDERR "$expectedFile\n";
 	} else {
 		unlink $expectedFile;
 	}
 }
 
+$elapsed = time - $start;
+print STDERR "Elapsed time pre-printing: $elapsed seconds\n";
+
 # deal with matches
 if ($matchedReads) {
+	if ( ($cpMatchesCount < $outSortLimit) and not $threaded) { $directWrite = 0 } else { $directWrite = 1 }
+	($myheader, $dwheader, $dwfooter) = printHeaderFooter($prefix, $cycles, $directWrite) unless $threaded;
 	open MATCHES, ">$txtFileDWallTags" or die "could not write $txtFileDWallTags: $!";
+	if ($filterMatches) {
+		open MATCHES2, ">$txtFileDWfilter" or die "could not write $txtFileDWfilter: $!";
+	}
+	if ($directWrite) {
+		print MATCHES $dwheader; print MATCHES $myheader;
+		if ($filterMatches) {
+			print MATCHES2 $dwheader; print MATCHES2 $myheader;
+		}
+	}
 	foreach $closingPrimerId (@closingPrimerIds) {
 		if ( $librarySizeCP{$closingPrimerId} and $matchedCPreads{$closingPrimerId} ) {
 			$librarySizeNorm{$closingPrimerId} = $librarySizeCP{$closingPrimerId} / $matchedCPreads{$closingPrimerId};
@@ -1149,11 +1174,11 @@ if ($matchedReads) {
 			$librarySizeNorm{$closingPrimerId} = 0;
 		}
 	}
-	foreach $cpMatch (keys %indexMatches) {
+	foreach $cpMatch (keys %cpMatchesCounts) {
 		($closingPrimerId, $match) = split ";", $cpMatch;
-		$matchCount = $indexMatches{$cpMatch}{count};
-		$dedupCount = $indexMatches{$cpMatch}{dedup};
-		$strandCount = sprintf( "%.3f", abs( $indexMatches{$cpMatch}{strand} / $matchCount ) );
+		$matchCount = $cpMatchesCounts{$cpMatch};
+		$dedupCount = $cpMatchesDedups{$cpMatch};
+		$strandCount = sprintf( "%.3f", abs( $cpMatchesStrand{$cpMatch} / $matchCount ) );
 		$dedupedReads += $dedupCount;
 		$cpLibrarySizeNorm = $librarySizeNorm{$closingPrimerId};
 		if ($checkValidTags) {
@@ -1178,11 +1203,17 @@ if ($matchedReads) {
 			$nonexpectedDedupMatchCounts{$closingPrimerId} += $dedupCount;
 		}
 		if ($threaded) {
-			$degenSeq = join ",", keys %{ $indexMatches{$cpMatch}{dedups} };
-			print MATCHES "$match$closingPrimerId\t$matchCount\t$expected\t$degenSeq\n";
+			$degenSeqs = $cpMatchesDedupStrings{$cpMatch};
+			chop $degenSeqs;
+			if ($filterMatches) {
+				$outLine = "$match$closingPrimerId\t$matchCount\t$expected\t$degenSeqs\n";
+				print MATCHES $outLine; print MATCHES2 $outLine;
+			} else {
+				print MATCHES "$match$closingPrimerId\t$matchCount\t$expected\t$degenSeqs\n";
+			}
 		} else {
 			if ($printOver) {
-				$overTagString = $indexMatches{$cpMatch}{sd};
+				$overTagString = $cpMatchesSD{$cpMatch};
 				@matchedTags = split "\t", $match;
 				foreach $type (@tagsOverTypes) {
 					$overTagValue = 0;
@@ -1219,49 +1250,56 @@ if ($matchedReads) {
 			}
 			$matchCountNorm = sprintf "%.5f", $matchCount * $cpLibrarySizeNorm;
 			$dedupCountNorm = sprintf "%.5f", $dedupCount * $cpLibrarySizeNorm;
-			print MATCHES "$match$closingPrimerId\t$matchCount\t$dedupCount\t$strandCount\t$matchCountNorm\t$dedupCountNorm\t$expected$overTagString\n";
-		}
-	}
-	close MATCHES;
-	if ( ($cpMatchesCount < $outSortLimit) and not $threaded) {
-		system "sort -k" . ($cycles + 2) . "rn $txtFileDWallTags > $txtFileDWallTags.sortTemp";
-	} else {
-		rename $txtFileDWallTags, "$txtFileDWallTags.sortTemp";
-	}
-	if ($filterMatches) {
-		system "cp $txtFileDWallTags.sortTemp $txtFileDWfilter.sortTemp";
-	}
-	open MATCHES, ">>$txtFileDWallTags.sortTemp" or die "could not write $txtFileDWallTags.sortTemp: $!";
-	foreach $closingPrimerId (sort keys %idTagsMissing) {
-		foreach $cycleIndex ( sort {$a<=>$b} keys %{ $idTagsMissing{$closingPrimerId} } ) {
-			foreach $tagCode ( sort keys %{ $idTagsMissing{$closingPrimerId}{$cycleIndex} } ) {
-				$match = "";
-				for (0..$cycles-1) {
-					if ($cycleIndex == $_) { $match .= "$tagCode\t" } else { $match .= "\t" }
-				}
-				print MATCHES "$match$closingPrimerId\t0\t0\t0\t0\t0\t$idTagsMissing{$closingPrimerId}{$cycleIndex}{$tagCode}\t0\t0$tagsOverTabBlanks\n";
+			if ($filterMatches) {
+				$outLine = "$match$closingPrimerId\t$matchCount\t$dedupCount\t$strandCount\t$matchCountNorm\t$dedupCountNorm\t$expected$overTagString\n";
+				print MATCHES $outLine; print MATCHES2 $outLine;
+			} else {
+				print MATCHES "$match$closingPrimerId\t$matchCount\t$dedupCount\t$strandCount\t$matchCountNorm\t$dedupCountNorm\t$expected$overTagString\n";
 			}
 		}
 	}
+	if ($filterMatches) {
+		if ($directWrite) { print MATCHES2 $dwfooter }
+		close MATCHES2;
+	}
+	foreach $closingPrimerId (sort keys %idTagsMissing) {
+		foreach $cycleIndex ( sort {$a<=>$b} keys %{ $idTagsMissing{$closingPrimerId} } ) {
+			foreach $tagString ( sort keys %{ $idTagsMissing{$closingPrimerId}{$cycleIndex} } ) {
+				$match = "";
+				for (0..$cycles-1) {
+					if ($cycleIndex == $_) { $match .= "$tagString\t" } else { $match .= "\t" }
+				}
+				if ($tagString =~ /(^\S*?[0-9]+[.-][0-9]+)-[ACGT]+/) {
+					$expected = $validTagCodesCP{$closingPrimerId}{$1} ? 1 : 0;
+				} else {
+					$expected = 0;
+				}
+				print MATCHES "$match$closingPrimerId\t0\t0\t0\t0\t0\t$expected$tagsOverTabBlanks\n";
+			}
+		}
+	}
+	if ($directWrite) { print MATCHES $dwfooter }
 	close MATCHES;
-	if ($threaded) {
-		rename "$txtFileDWallTags.sortTemp", $txtFileDWallTags;
-		rename "$txtFileDWfilter.sortTemp", $txtFileDWfilter;
-	} else {
-		writeFiles("$prefix.dwheader", $txtFileDWallTags, 0);
-		writeFiles("$prefix.header", $txtFileDWallTags, 1);
-		writeFiles("$txtFileDWallTags.sortTemp", $txtFileDWallTags, 1);
-		writeFiles("$prefix.dwfooter", $txtFileDWallTags, 1);
-		unlink "$txtFileDWallTags.sortTemp";
+	unless ($threaded) {
+		unless ($directWrite) {
+			system "sort -k" . ($cycles + 2) . "rn $txtFileDWallTags > $txtFileDWallTags.sortTemp";
+			system "cat $prefix.dwheader $prefix.myheader $txtFileDWallTags.sortTemp $prefix.dwfooter > $txtFileDWallTags";
+			unlink "$txtFileDWallTags.sortTemp";
+		}
 		print STDERR "$txtFileDWallTags\n";
 		if ($filterMatches) {
-			writeFiles("$prefix.dwheader", $txtFileDWfilter, 0);
-			writeFiles("$prefix.header", $txtFileDWfilter, 1);
-			writeFiles("$txtFileDWfilter.sortTemp", $txtFileDWfilter, 1);
-			writeFiles("$prefix.dwfooter", $txtFileDWfilter, 1);
-			unlink "$txtFileDWfilter.sortTemp";
+			unless ($directWrite) {
+				system "sort -k" . ($cycles + 2) . "rn $txtFileDWfilter > $txtFileDWfilter.sortTemp";
+				system "cat $prefix.dwheader $prefix.myheader $txtFileDWfilter.sortTemp $prefix.dwfooter > $txtFileDWfilter";
+				unlink "$txtFileDWfilter.sortTemp";
+			}
 			print STDERR "$txtFileDWfilter\n";
 		}
+	}
+	unless ($directWrite) {
+		unlink "$prefix.myheader";
+		unlink "$prefix.dwheader";
+		unlink "$prefix.dwfooter";
 	}
 }
 
@@ -1338,26 +1376,15 @@ if ($totalReads) {
 }
 
 # end
-unlink "$prefix.header";
-unlink "$prefix.dwheader";
-unlink "$prefix.dwfooter";
-exit;
-
-sub writeFiles {
-	my ($inFile, $outFile, $append) = @_;
-	if ($append) { $appendString = ">>" } else { $appendString = ">" }
-	open IN, $inFile or die "could not read $inFile: $!";
-	open OUT, $appendString, $outFile or die "could not write $outFile: $!";
-	while (<IN>) { print OUT } close OUT; close IN;
-}
+exit 0;
 
 sub printHeaderFooter {
-	my ($prefix, $cycles) = @_;
-	$dwheader = '<datawarrior-fileinfo>
+	my ($prefix, $cycles, $directWrite) = @_;
+	my $dwheader = '<datawarrior-fileinfo>
 <version="3.1">
 </datawarrior-fileinfo>
 ';
-	$dwfooter = '<datawarrior properties>
+	my $dwfooter = '<datawarrior properties>
 <chartType_DEDUP="scatter">
 <chartType_RAW="scatter">
 <colorColumn_DEDUP="DEDUP">
@@ -1404,13 +1431,13 @@ sub printHeaderFooter {
 <fastRendering_DEDUP="true">
 <fastRendering_RAW="true">
 ';
-	$header = "";
+	my $myheader = "";
 	for ($i = 0; $i < $cycles; $i++) {
-		$header .= "TAG" . ($i + 1) . "\t";
+		$myheader .= "TAG" . ($i + 1) . "\t";
 		$dwfooter .= "<axisColumn_RAW_$i=\"TAG" . ($i + 1) . "\">\n";
 		$dwfooter .= "<filter$i=\"#string#\tTAG" . ($i + 1) . "\">\n";
 	}
-	$header .= "CP\tRAW\tDEDUP\tSTRANDBIAS\tRAW_NORM\tDEDUP_NORM\tEXPECTED$tagsOverHeader\n";
+	$myheader .= "CP\tRAW\tDEDUP\tSTRANDBIAS\tRAW_NORM\tDEDUP_NORM\tEXPECTED$tagsOverHeader\n";
 	$j = $i - 1;
 	$j++; $dwfooter .= "<filter$j=\"#string#\tCP\">\n";
 	$j++; $dwfooter .= "<filter$j=\"#double#\tRAW\">\n";
@@ -1425,12 +1452,15 @@ sub printHeaderFooter {
 		$j++; $dwfooter .= "<filter$j=\"#category#\tOVER_UNIQUE_$overString\">\n";
 	}
 	$dwfooter .= "</datawarrior properties>\n";
-	open OUT, ">$prefix.header" or die;
-	print OUT $header; close OUT;
-	open OUT, ">$prefix.dwheader" or die;
-	print OUT $dwheader; close OUT;
-	open OUT, ">$prefix.dwfooter" or die;
-	print OUT $dwfooter; close OUT;
+	unless ($directWrite) {
+		open OUT, ">$prefix.myheader" or die;
+		print OUT $myheader; close OUT;
+		open OUT, ">$prefix.dwheader" or die;
+		print OUT $dwheader; close OUT;
+		open OUT, ">$prefix.dwfooter" or die;
+		print OUT $dwfooter; close OUT;
+	}
+	return $myheader, $dwheader, $dwfooter;
 }
 
 sub splitJoin {

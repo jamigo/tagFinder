@@ -64,7 +64,7 @@ OPTIONS:
   -r  recovery mode (try to find new matches in processed reads)
   -R  print recovered cycles
   -T  number of reads to test analysis (default: 0)
-  -x  number of threads (default: 1) [ NOT FULLY FUNCTIONAL ]
+  -x  number of threads (default: 1)
   -h  this (help) message
 
 EOF
@@ -83,11 +83,11 @@ use Getopt::Std;
 my $opt_string = 'f:t:h:o:p:a:q:lsSiNODIXLEcewv:V:Wd:rRT:x:h';
 getopts("$opt_string", \%opt) or usage();
 usage() if $opt{h};
-$tagFile = $opt{t} ? $opt{t} : "";
+if ( $opt{f} ) { $fastqFile = $opt{f} } else { usage() }
+$tagFiles = $opt{t} ? $opt{t} : "";
 $headpieces = $opt{h} ? $opt{h} : "";
 $overhangs = $opt{o} ? $opt{o} : "";
 $closingprimers = $opt{p} ? $opt{p} : "";
-$fastqFile = $opt{f} ? $opt{f} : "";
 $mbq = defined $opt{q} ? $opt{q} : 0;
 $anchorSize = $opt{a} ? $opt{a} : 7;
 $leftAnchored = $opt{l} ? 1 : 0;
@@ -119,8 +119,10 @@ $printDegen = 0;
 # max number of compounds to sort at output
 $outSortLimit = 100000;
 
-usage() unless $fastqFile;
+# initialize the label for empty anchor tags
+$noFwAnchorTag = "";
 
+# get prefix from file name
 if ($fastqFile =~ /([^\/]+)\.[fastq]+(\.gz)?(\.(\d+))?/i) {
 	$prefix = $1;
 	$prefix .= ".$4" if $4;
@@ -134,24 +136,7 @@ if ($fastqFile =~ /([^\/]+)\.[fastq]+(\.gz)?(\.(\d+))?/i) {
 	die "could not find a valid prefix in $fastqFile";
 }
 
-$threaded = 0;
-if ($threads > 1) {
-	if ($fastqFile =~ /\.\d+$/) {
-		$threaded = 1;
-	} else {
-		splitJoin($fastqFile, $prefix, $threads);
-	}
-}
-
-# fastq qualities
-if ($mbq) {
-	# !"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~
-	$fastqQuals = '!"#$%&\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~';
-	$lowQualChars = substr($fastqQuals, 0, $mbq + 1);
-	$lowQualRegex = qr/[$lowQualChars]/
-}
-
-# file names
+# define file names
 ($configFile = $0) =~ s/([^\/]+)\.pl$/$1.config.ini/;
 ($tagsPath = $0) =~ s/bins\/[^\/]+$/tags\//;
 $txtFileDWallTags = "tags_$prefix.allTags.dwar";
@@ -169,8 +154,30 @@ $expectedFile = "tags_$prefix.expected.txt";
 $tagCountsFile = "tags_$prefix.tagcounts.txt";
 $logFile = "tags_$prefix.log";
 
-$noFwAnchorTag = "";
+# deal with threading
+$fastqFiles = 0;
+foreach (<$fastqFile.*>) { $fastqFiles++ }
+if ($threads > 1) {
+	if ($fastqFile =~ /\.\d+$/) {
+		$threaded = 1;
+	} else {
+		$threaded = 0;
+		unless ($fastqFiles) {
+			split_and_fork($fastqFile, $prefix, $threads);
+			foreach (<$fastqFile.*>) { $fastqFiles++ }
+		}
+	}
+}
 
+# fastq qualities
+if ($mbq) {
+	# !"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~
+	$fastqQuals = '!"#$%&\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~';
+	$lowQualChars = substr($fastqQuals, 0, $mbq + 1);
+	$lowQualRegex = qr/[$lowQualChars]/
+}
+
+# prepare strings and file headers for overrepresented sequences
 if ($printOver) {
 	$tagsOverHeader = "\tSDCOUNT_RAW\tSDCOUNT_DEDUP";
 	$tagsOverTabBlanks = "\t0\t0";
@@ -196,7 +203,7 @@ if (open CONFIG, $configFile) {
 			($f, $i, $t, $h, $o, $p, $v, $V) = split "\t";
 			if ($fastqFile =~ /$f/i or $f =~ /$fastqFile/i) {
 				$reverseCycles = $reverseCycles ? $reverseCycles : $i;
-				$tagFile = $tagFile ? $tagFile : $t;
+				$tagFiles = $tagFiles ? $tagFiles : $t;
 				$headpieces = $headpieces ? $headpieces : $h if $h;
 				$overhangs = $overhangs ? $overhangs : $o if $o;
 				$closingprimers = $closingprimers ? $closingprimers : $p if $p;
@@ -208,14 +215,7 @@ if (open CONFIG, $configFile) {
 	}
 	close CONFIG;
 }
-
-usage() unless $tagFile;
-
-# look for libraries in tag file name
-if ($tagFile =~ /:/) {
-	while ($tagFile =~ /:([^:,\s]+)/g) { $libSelect{$1} = 1 }
-	$tagFile =~ s/:.+//;
-}
+usage() unless $tagFiles;
 
 # convert dots to pattern
 $validTags =~ s/\./\\./g;
@@ -223,125 +223,135 @@ $invalidTags =~ s/\./\\./g;
 $checkValidTags = $validTags or $invalidTags ? 1 : 0;
 
 # check for everything needed
+@tagFilesArray = split ",", $tagFiles;
 @headpiecesArray = split ",", $headpieces;
 @overhangsArray = split ",", $overhangs;
 @closingprimersArray = split ",", $closingprimers;
 @validTagsArray = split ",", $validTags;
 @invalidTagsArray = split ",", $invalidTags;
 
-# read tag file
-if ( ! -f $tagFile and -f "$tagsPath$tagFile") { $tagFile = "$tagsPath$tagFile" }
-open TAGS, $tagFile or die "could not open $tagFile: $!";
-while (<TAGS>) {
-	if (/^#ID\tSEQUENCE\t/) {
-		s/[\r\n]//g;
-		@cols = split "\t";
-		$checkValidTags = 1;
-		for ($i = 2; $i <= $#cols; $i++) {
-			$headerIndex{$i} = $cols[$i];
-		}
-	} elsif (/^CPL/) {
-		s/[\r\n]//g;
-		@cols = split "\t";
-		$closingPrimer = "$cols[0]-$cols[1]";
-		($closingPrimerId = $closingPrimer) =~ s/N[^-]+$//;
-		for ($i = 2; $i <= $#cols; $i++) {
-			if ( $cols[$i] and ( not %libSelect or exists $libSelect{ $headerIndex{$i} } ) ) {
-				$libraryCPs{$closingPrimer} = 1;
-				$libraryCPId{ $headerIndex{$i} }{$closingPrimerId} = 1;
+# read tag files
+foreach $tagFile (@tagFilesArray) {
+	# look for libraries in tag file name
+	# (all other libraries will be discarded)
+	@libs2select = split ";", $tagFile;
+	$tagFile = shift @libs2select;
+	%selectedLibs = ();
+	foreach (@libs2select) { $selectedLibs{$_} = 1 }
+	# read tag files
+	if ( ! -f $tagFile and -f "$tagsPath$tagFile") { $tagFile = "$tagsPath$tagFile" }
+	open TAGS, $tagFile or die "could not open $tagFile: $!";
+	while (<TAGS>) {
+		if (/^#ID\tSEQUENCE\t/) {
+			s/[\r\n]//g;
+			@cols = split "\t";
+			$checkValidTags = 1;
+			for ($i = 2; $i <= $#cols; $i++) {
+				$headerIndex{$i} = $cols[$i];
 			}
-		}
-	} elsif (/(^\S*?([0-9]+)[.-][0-9]+)\t([ACGT]+)/) {
-		$tagCode = $1;
-		$cycle = $2;
-		$tag = $3;
-		if ($reverseCycles && $cycle % 2 == 0) {
-			($tag = reverse $tag) =~ tr/ACGT/TGCA/;
-		}
-		if ( exists $tags{$cycle}{$tag} ) {
-			$existingTags .= "$tag already exists: $tagCode vs $tags{$cycle}{$tag}\n";
-		} else {
-			$cycleTags{$cycle} = ";" unless exists $cycleTags{$cycle};
-			$cycleTags{$cycle} .= "$tag;";
-			$tags{$cycle}{$tag} = $tagCode;
-			if (%libraryCPId) {
-				s/[\r\n]//g;
-				@cols = split "\t";
-				for ($i = 2; $i <= $#cols; $i++) {
-					if ( $cols[$i] and ( not %libSelect or exists $libSelect{ $headerIndex{$i} } ) ) {
-						foreach $closingPrimerId ( keys %{ $libraryCPId{ $headerIndex{$i} } } ) {
-							$libraryTagsCP{$closingPrimerId}{$cycle}++;
-							$validTagCodesCP{$closingPrimerId}{$tagCode} = 1;
-						}
-					}
+		} elsif (/^CPL/) {
+			s/[\r\n]//g;
+			@cols = split "\t";
+			$closingPrimer = "$cols[0]-$cols[1]";
+			($closingPrimerId = $closingPrimer) =~ s/N[^-]+$//;
+			for ($i = 2; $i <= $#cols; $i++) {
+				if ( $cols[$i] and ( not %selectedLibs or exists $selectedLibs{ $headerIndex{$i} } ) ) {
+					$libraryCPs{$closingPrimer} = 1;
+					$libraryCPId{ $headerIndex{$i} }{$closingPrimerId} = 1;
 				}
 			}
-			if ($checkValidTags) {
-				$validFlag = 0;
-				foreach (@validTagsArray) {
-					@cols = split ";";
-					$validTag = $cols[$#cols];
-					if ($tagCode =~ /$validTag/) {
-						if ($#cols) {
-							for ($i = 0; $i < $#cols; $i++) {
-								$closingPrimerId = $cols[$i];
-								$closingPrimerId =~ s/N[^-]+$//;
-								unless ( exists $validTagCodesCP{$closingPrimerId}{$tagCode} ) {
-									$libraryTagsCP{$closingPrimerId}{$cycle}++;
-									$validTagCodesCP{$closingPrimerId}{$tagCode} = 1;
-								}
+		} elsif (/(^\S*?([0-9]+)[.-][0-9]+)\t([ACGT]+)/) {
+			$tagCode = $1;
+			$cycle = $2;
+			$tag = $3;
+			if ($reverseCycles && $cycle % 2 == 0) {
+				($tag = reverse $tag) =~ tr/ACGT/TGCA/;
+			}
+			if ( exists $tags{$cycle}{$tag} ) {
+				$existingTags .= "$tag already exists: $tagCode vs $tags{$cycle}{$tag}\n";
+			} else {
+				$cycleTags{$cycle} = ";" unless exists $cycleTags{$cycle};
+				$cycleTags{$cycle} .= "$tag;";
+				$tags{$cycle}{$tag} = $tagCode;
+				if (%libraryCPId) {
+					s/[\r\n]//g;
+					@cols = split "\t";
+					for ($i = 2; $i <= $#cols; $i++) {
+						if ( $cols[$i] and ( not %selectedLibs or exists $selectedLibs{ $headerIndex{$i} } ) ) {
+							foreach $closingPrimerId ( keys %{ $libraryCPId{ $headerIndex{$i} } } ) {
+								$libraryTagsCP{$closingPrimerId}{$cycle}++;
+								$validTagCodesCP{$closingPrimerId}{$tagCode} = 1;
 							}
-						} else {
-							$validFlag = 1;
 						}
 					}
 				}
-				foreach (@invalidTagsArray) {
-					@cols = split ";";
-					$invalidTag = $cols[$#cols];
-					if ($tagCode =~ /$invalidTag/) {
-						if ($#cols) {
-							for ($i = 0; $i < $#cols; $i++) {
-								$closingPrimerId = $cols[$i];
-								$closingPrimerId =~ s/N[^-]+$//;
-								if ( exists $validTagCodesCP{$closingPrimerId}{$tagCode} ) {
-									$libraryTagsCP{$closingPrimerId}{$cycle}--;
-									delete $validTagCodesCP{$closingPrimerId}{$tagCode};
-								} else {
-									foreach $validCpId (keys %validTagCodesCP) {
-										if ($validCpId =~ /$closingPrimerId/) {
-											if ( exists $validTagCodesCP{$validCpId}{$tagCode} ) {
-												$libraryTagsCP{$validCpId}{$cycle}--;
-												delete $validTagCodesCP{$validCpId}{$tagCode};
+				if ($checkValidTags) {
+					$validFlag = 0;
+					foreach (@validTagsArray) {
+						@cols = split ";";
+						$validTag = $cols[$#cols];
+						if ($tagCode =~ /$validTag/) {
+							if ($#cols) {
+								for ($i = 0; $i < $#cols; $i++) {
+									$closingPrimerId = $cols[$i];
+									$closingPrimerId =~ s/N[^-]+$//;
+									unless ( exists $validTagCodesCP{$closingPrimerId}{$tagCode} ) {
+										$libraryTagsCP{$closingPrimerId}{$cycle}++;
+										$validTagCodesCP{$closingPrimerId}{$tagCode} = 1;
+									}
+								}
+							} else {
+								$validFlag = 1;
+							}
+						}
+					}
+					foreach (@invalidTagsArray) {
+						@cols = split ";";
+						$invalidTag = $cols[$#cols];
+						if ($tagCode =~ /$invalidTag/) {
+							if ($#cols) {
+								for ($i = 0; $i < $#cols; $i++) {
+									$closingPrimerId = $cols[$i];
+									$closingPrimerId =~ s/N[^-]+$//;
+									if ( exists $validTagCodesCP{$closingPrimerId}{$tagCode} ) {
+										$libraryTagsCP{$closingPrimerId}{$cycle}--;
+										delete $validTagCodesCP{$closingPrimerId}{$tagCode};
+									} else {
+										foreach $validCpId (keys %validTagCodesCP) {
+											if ($validCpId =~ /$closingPrimerId/) {
+												if ( exists $validTagCodesCP{$validCpId}{$tagCode} ) {
+													$libraryTagsCP{$validCpId}{$cycle}--;
+													delete $validTagCodesCP{$validCpId}{$tagCode};
+												}
 											}
 										}
 									}
 								}
+							} else {
+								$validFlag = 0;
 							}
-						} else {
-							$validFlag = 0;
 						}
 					}
+					if ($validFlag) {
+						$libraryTags{$cycle}++;
+						$validTagCodes{$tagCode} = 1;
+					}
 				}
-				if ($validFlag) {
+				unless (%libraryCPId or $checkValidTags) {
 					$libraryTags{$cycle}++;
-					$validTagCodes{$tagCode} = 1;
+				}
+				if ( not exists $cycleLengths{$cycle} ) {
+					$cycleLengths{$cycle} = length($tag);
+				} elsif (length($tag) != $cycleLengths{$cycle}) {
+					die "diferent tag lengths in cycle $cycle";
 				}
 			}
-			unless (%libraryCPId or $checkValidTags) {
-				$libraryTags{$cycle}++;
-			}
-			if ( not exists $cycleLengths{$cycle} ) {
-				$cycleLengths{$cycle} = length($tag);
-			} elsif (length($tag) != $cycleLengths{$cycle}) {
-				die "diferent tag lengths in cycle $cycle";
-			}
+		} else {
+			die "unknown tag format $_";
 		}
-	} else {
-		die "unknown tag format $_";
 	}
+	close TAGS;
 }
-close TAGS;
 
 # check closing primers if needed
 if (%libraryCPs) {
@@ -431,6 +441,7 @@ foreach $closingPrimer (@closingprimersArray) {
 			$maxDegenErrors = $lengthN - 1;
 		}
 	} else {
+		$staticSeq = $closingPrimer;
 		if ($anchorSize > length($closingPrimer)) {
 			die "anchor size must be smaller than " . length($closingPrimer) . ", cause closing primer";
 		}
@@ -490,75 +501,100 @@ if (@overhangsArray) {
 	push @overhangsArray, "";
 }
 
-# get reads
-$matchedReads = 0;
-$dedupedReads = 0;
-if ($printInvalid) { open INVALID, ">$invalidFile" or die "could not write $invalidFile: $!" }
-open FASTQ, "seqtk seq $fastqFile |"
-	or open FASTQ, "gunzip -fc $fastqFile |"
-	or die "could not open $fastqFile";
-while (<FASTQ>) {
-	$seq = <FASTQ>;
-	<FASTQ>;
-	$qual = <FASTQ>;
-	$totalReads++;
-	$recoverRead = 0;
-	if ($testReads) {
-		if ($totalReads > $testReads) {
-			print STDERR "\n* TEST RUN: $testReads reads analyzed *\n\n";
-			$totalReads--;
-			last;
-		}
-	}
-RECOVERY:
-	if (length($seq) < $minSeqLength) {
-		$shorterReads++ unless $recoverRead;
-		next;
-	} else {
-		$forward = "";
-		$tagString = "";
-		$staticSeq = "";
-		$shortRead = 0;
-		$openedRead = 0;
-		$tagPosMatch = 0;
-		$closingPrimerId = "";
-		ANCHORLOOP: for ($i = 0; $i < $primerNumber; $i++) {
-			# qr/$fwAnchor5(.+)/ qr/$rvAnchor5(.+)/
-			if ($seq =~ $anchor5regexes[$i]) {
-				$openedRead = 1;
-				$anchoredSeq = $1;
-				if (length($anchoredSeq) < $anchoredTagsLength) {
-					$shortRead = 1 unless $tagPosMatch;
-				} else {
-					if ($i < $headPieceNumber) {
-						$forward = 1; $jMin = $headPieceNumber; $jMax = $primerNumber;
-					} else {
-						$forward = 0; $jMin = 0; $jMax = $headPieceNumber;
-					}
-					$shortRead = 0;
-					$tagPosMatch = $-[0] + $anchorSize;
-					for ($j = $jMin; $j < $jMax; $j++) {
-						# qr/(.+?)$rvAnchor3/ qr/(.+?)$fwAnchor3/
-						if ($anchoredSeq =~ $anchor3regexes[$j]) {
-							$openedRead = 0;
-							$tagString = $1;
-							$staticSeq = $staticSeqs[$i];
-							$staticSeqLength = $staticSeqLengths[$i];
-							$closingPrimerId = $forward ? $closingPrimerIds[$j - $headPieceNumber] : $closingPrimerIds[$i - $headPieceNumber];
-							last ANCHORLOOP;
-						} elsif ($leftAnchored) {
-							$tagString = $anchoredSeq;
-						}
+if ($fastqFiles) {
+	foreach $splitResult (<tags_$prefix.*.allTags.dwar>) {
+		open SPLIT, $splitResult or die "could not read $splitResult: $!";
+		while (<SPLIT>) {
+			($match, $closingPrimerId, $matchCount, $strandCount, $degenSeqs) = split ",";
+			$cpMatch = "$closingPrimerId;$match";
+			$cpMatchesCounts{$cpMatch} += $matchCount;
+			$matchedCPreads{$closingPrimerId} += $matchCount;
+			$cpMatchesStrand{$cpMatch} += $strandCount;
+			if ($degenSeqs) {
+				$cpMatchesDedupStrings{$cpMatch} .= "$degenSeqs;";
+				if ($printDegen) {
+					foreach $degenSeq (split ";", $degenSeqs) {
+						$degenCounts{$closingPrimerId}{$degenSeq}++;
 					}
 				}
 			}
 		}
-		if ($similarTags and not $tagString) {
-			SIMILARLOOP: for ($i = 0; $i < $primerNumber; $i++) {
-				# qr/($fwAnchor5pattern)(.+)/ qr/($rvAnchor5pattern)(.+)/
-				if ($seq =~ $anchor5regexesSimilar[$i]) {
+		close SPLIT;
+		unlink $splitResult;
+	}
+	foreach $splitResult (<tags_$prefix.*.log>) {
+		open SPLIT, $splitResult or die "could not read $splitResult: $!";
+		while (<SPLIT>) {
+			if (/^Total:\s+(\d+)/) { $totalReads += $1 }
+			elsif (/^Valid:\s+(\d+)/) { $validReads += $1 }
+			elsif (/^Almost:\s+(\d+)/) { $maxLengthSurround += $1 }
+			elsif (/^MaxTagLength:\s+(\d+)/) { $maxTagLength += $1 / $fastqFiles; }
+			elsif (/^MaxLengthCount:\s+(\d+)/) { $maxLengthCount += $1 }
+			elsif (/^Opened:\s+(\d+)/) { $openedReads += $1 }
+			elsif (/^Forward:\s+(\d+)/) { $forwardReads += $1 }
+			elsif (/^Reverse:\s+(\d+)/) { $reverseReads += $1 }
+			elsif (/^Similar:\s+(\d+)/) { $similarReads += $1 }
+			elsif (/^Shorter:\s+(\d+)/) { $shorterReads += $1 }
+			elsif (/^Longer:\s+(\d+)/) { $longerReads += $1 }
+			elsif (/^Reduced:\s+(\d+)/) { $reducedReads += $1 }
+			elsif (/^LowQual:\s+(\d+)/) { $lowQualReads += $1 }
+			elsif (/^Invalid:\s+(\d+)/) { $invalidReads += $1 }
+			elsif (/^Recover:\s+(\d+)/) { $recoverReads += $1 }
+			elsif (/^Deletions:\s+(\d+)/) { $similarCount{"del"} += $1 }
+			elsif (/^Insertions:\s+(\d+)/) { $similarCount{"ins"} += $1 }
+			elsif (/^1bVariants:\s+(\d+)/) { $similarCount{"var"} += $1 }
+			elsif (/^Chimera:\s+(\d+)/) { $chimeraReads += $1 }
+			elsif (/^Unfound:\s+(\d+)/) { $unfoundReads += $1 }
+			elsif (/^Undedup:\s+(\d+)/) { $undedupReads += $1 }
+			elsif (/^Matched:\s+(\d+)/) { $matchedReads += $1 }
+			elsif (/^Matched recovered:\s+(\d+)/) { $matchedReadsRecovered += $1 }
+		}
+		close SPLIT;
+		unlink $splitResult;
+	}
+	foreach (<$fastqFile.*>) { unlink $_; }
+} else {
+	# get reads
+	$matchedReads = 0;
+	$dedupedReads = 0;
+	if ($printInvalid) { open INVALID, ">$invalidFile" or die "could not write $invalidFile: $!" }
+	if (-f $fastqFile) {
+		open FASTQ, "seqtk seq $fastqFile |"
+		or open FASTQ, "gunzip -fc $fastqFile |"
+		or die "could not open $fastqFile";
+	} else {
+		die "cannot find $fastqFile";
+	}
+	while (<FASTQ>) {
+		$seq = <FASTQ>;
+		<FASTQ>;
+		$qual = <FASTQ>;
+		$totalReads++;
+		$recoverRead = 0;
+		if ($testReads) {
+			if ($totalReads > $testReads) {
+				print STDERR "\n* TEST RUN: $testReads reads analyzed *\n\n";
+				$totalReads--;
+				last;
+			}
+		}
+	RECOVERY:
+		if (length($seq) < $minSeqLength) {
+			$shorterReads++ unless $recoverRead;
+			next;
+		} else {
+			$forward = "";
+			$tagString = "";
+			$staticSeq = "";
+			$shortRead = 0;
+			$openedRead = 0;
+			$tagPosMatch = 0;
+			$closingPrimerId = "";
+			ANCHORLOOP: for ($i = 0; $i < $primerNumber; $i++) {
+				# qr/$fwAnchor5(.+)/ qr/$rvAnchor5(.+)/
+				if ($seq =~ $anchor5regexes[$i]) {
 					$openedRead = 1;
-					$anchoredSeq = $2;
+					$anchoredSeq = $1;
 					if (length($anchoredSeq) < $anchoredTagsLength) {
 						$shortRead = 1 unless $tagPosMatch;
 					} else {
@@ -570,14 +606,14 @@ RECOVERY:
 						$shortRead = 0;
 						$tagPosMatch = $-[0] + $anchorSize;
 						for ($j = $jMin; $j < $jMax; $j++) {
-							# qr/(.{$tagsLengthLow,$tagsLengthTop})$rvAnchor3/ qr/(.{$tagsLengthLow,$tagsLengthTop})$fwAnchor3/
-							if ($anchoredSeq =~ $anchor3regexesSimilar[$j]) {
+							# qr/(.+?)$rvAnchor3/ qr/(.+?)$fwAnchor3/
+							if ($anchoredSeq =~ $anchor3regexes[$j]) {
 								$openedRead = 0;
 								$tagString = $1;
 								$staticSeq = $staticSeqs[$i];
 								$staticSeqLength = $staticSeqLengths[$i];
 								$closingPrimerId = $forward ? $closingPrimerIds[$j - $headPieceNumber] : $closingPrimerIds[$i - $headPieceNumber];
-								last SIMILARLOOP;
+								last ANCHORLOOP;
 							} elsif ($leftAnchored) {
 								$tagString = $anchoredSeq;
 							}
@@ -585,223 +621,274 @@ RECOVERY:
 					}
 				}
 			}
-		}
-	}
-	$openedReads++ if $openedRead and not $recoverRead;
-	if ($shortRead) {
-		$shorterReads++ unless $recoverRead;
-		next;
-	} elsif ($tagString) {
-		unless ($forward) {
-			($tagString = reverse $tagString) =~ tr/ACGT/TGCA/;
-		}
-		if ($cleanDegen) {
-			$beginningSeqs{$staticSeq}{ substr($seq, 0, $staticSeqLength) }++ if $staticSeq;
-		}
-		if ($recoverRead) {
-			$recoverReads++;
-			$recoverReadCount{$recoverRead}++;
-			$recoverReadCount{$recoverRead-1}-- if $recoverRead > 1;
-		}
-		if ($mbq) {
-			if (substr($qual, $tagPosMatch, $tagsLength) =~ $lowQualRegex) {
-				$lowQualReads++ unless $recoverRead;
-				next;
-			}
-		}
-		$longer = 0;
-		$shorter = 0;
-		$similar = "";
-		$searchChimeras = 0;
-		@tagStrings = ();
-		@tagStringsErrorPos = ();
-		$tagLength = length($tagString);
-		$tagLengths{$tagLength}++;
-		if ($tagLength < $tagsLength) {
-			if ($similarTags and $tagLength == $tagsLength - 1) {
-				for ($baseno = $tagLength - 1; $baseno >= 0; $baseno--) {
-					foreach ("A", "C", "G", "T") {
-						$tempTagString = $tagString;
-						substr($tempTagString, $baseno, 1) .= $_;
-						push @tagStrings, $tempTagString;
-						push @tagStringsErrorPos, $baseno + 2;
-					}
-				}
-				foreach ("A", "C", "G", "T") {
-					push @tagStrings, $_.$tagString;
-					push @tagStringsErrorPos, 1;
-				}
-				$similar = "del";
-			} else {
-				$shorter = 1;
-			}
-		} elsif ($tagLength > $tagsLength) {
-			if ($similarTags and $tagLength == $tagsLength + 1) {
-				for ($baseno = $tagLength - 1; $baseno >= 0; $baseno--) {
-					$tempTagString = $tagString;
-					substr($tempTagString, $baseno, 1) = "";
-					push @tagStrings, $tempTagString;
-					push @tagStringsErrorPos, $baseno + 1;
-				}
-				$similar = "ins";
-			} else {
-				$longer = 1;
-				$searchChimeras = 1;
-				push @tagStrings, $tagString;
-			}
-		} else {
-			push @tagStrings, $tagString;
-		}
-		$tagStringIndex = 0;
-		TAGSTRINGS: foreach $tagString (@tagStrings) {
-			$match = "";
-			$matched = 0;
-			$chimera = 0;
-			$tagStart = 0;
-			for ($cycleIndex = 0; $cycleIndex < $cycles; $cycleIndex++) {
-				$cycle = $sortedCycles[$cycleIndex];
-				$cycleLength = $sortedCyclesLengths[$cycleIndex];
-				$tag = substr($tagString, $tagStart, $cycleLength);
-				if ($overhang = $overhangsArray[$cycleIndex]) {
-					$overhangLength = $overhangsLengths[$cycleIndex];
-					$postTag = substr($tagString, $tagStart + $cycleLength, $overhangLength);
-				} else {
-					$overhang = "";
-					$overhangLength = 0;
-					$postTag = "";
-				}
-				if ($searchChimeras) {
-					if ($tagCode = $tags{$cycle}{$tag}) {
-						$tagRepeats = $tagString =~ s/$tag$overhang//g;
-						if ($tagRepeats > 1) {
-							$chimera = 1;
-							$match .= "$tagCode-$tag*\t";
+			if ($similarTags and not $tagString) {
+				SIMILARLOOP: for ($i = 0; $i < $primerNumber; $i++) {
+					# qr/($fwAnchor5pattern)(.+)/ qr/($rvAnchor5pattern)(.+)/
+					if ($seq =~ $anchor5regexesSimilar[$i]) {
+						$openedRead = 1;
+						$anchoredSeq = $2;
+						if (length($anchoredSeq) < $anchoredTagsLength) {
+							$shortRead = 1 unless $tagPosMatch;
 						} else {
-							$matched++;
-							$match .= "$tagCode-$tag\t";
-						}
-					} else {
-						$match .= ".\t";
-						$tagStart += $cycleLength + $overhangLength;
-					}
-				} else {
-					unless ($similarTags) {
-						next TAGSTRINGS if $overhang ne $postTag;
-					}
-					if ($tagCode = $tags{$cycle}{$tag}) {
-						if ($checkValidTags and $similar) { next TAGSTRINGS unless exists $validTagCodesCP{$closingPrimerId}{$tagCode} }
-						$matched++;
-						$match .= "$tagCode-$tag\t";
-						$tagStart += $cycleLength + $overhangLength;
-						$matchedTags{$cycle}{$tag}++;
-					} elsif ($similarTags) {
-						$similarTagUnmatch = 1;
-						unless ($similarTagsStrict and $similar) {
-							for ($tagPos = $cycleLength - 1; $tagPos >= 0; $tagPos--) {
-								$tagPattern = $tag;
-								substr($tagPattern, $tagPos, 1) = "[ACGT]";
-								if ($cycleTags{$cycle} =~ /;($tagPattern);/) {
-									$tagCode = $tags{$cycle}{$1};
-									if ($checkValidTags) { next unless exists $validTagCodesCP{$closingPrimerId}{$tagCode} }
-									$errorPos = $tagStart + $tagPos + 1;
-									$similar .= ";var,$errorPos";
-									$matched++;
-									$match .= "$tagCode-$1\t";
-									$tagStart += $cycleLength + $overhangLength;
-									$matchedTags{$cycle}{$1}++;
-									$similarTagUnmatch = 0;
-									last;
+							if ($i < $headPieceNumber) {
+								$forward = 1; $jMin = $headPieceNumber; $jMax = $primerNumber;
+							} else {
+								$forward = 0; $jMin = 0; $jMax = $headPieceNumber;
+							}
+							$shortRead = 0;
+							$tagPosMatch = $-[0] + $anchorSize;
+							for ($j = $jMin; $j < $jMax; $j++) {
+								# qr/(.{$tagsLengthLow,$tagsLengthTop})$rvAnchor3/ qr/(.{$tagsLengthLow,$tagsLengthTop})$fwAnchor3/
+								if ($anchoredSeq =~ $anchor3regexesSimilar[$j]) {
+									$openedRead = 0;
+									$tagString = $1;
+									$staticSeq = $staticSeqs[$i];
+									$staticSeqLength = $staticSeqLengths[$i];
+									$closingPrimerId = $forward ? $closingPrimerIds[$j - $headPieceNumber] : $closingPrimerIds[$i - $headPieceNumber];
+									last SIMILARLOOP;
+								} elsif ($leftAnchored) {
+									$tagString = $anchoredSeq;
 								}
 							}
 						}
-						if ($similarTagUnmatch) {
-							$unmatchedTags{$cycle}{$tag}++;
-							next TAGSTRINGS;
-						}
-					} else {
-						$unmatchedTags{$cycle}{$tag}++;
-						next TAGSTRINGS;
 					}
 				}
 			}
-			last TAGSTRINGS if $matched == $cycles or $chimera;
-			$tagStringIndex++;
 		}
-		if ($chimera) {
-			$chimeraReads++ unless $recoverRead;
-			$chimeras{"$closingPrimerId;$match"}++;
-		} else {
-			if ($shorter) { $reducedReads++ unless $recoverRead; next }
-			if ($longer) { $longerReads++ unless $recoverRead; next unless $leftAnchored }
-			if ($similar) { $similarReads++ unless $recoverRead }
-			if ($forward) { $forwardReads++ unless $recoverRead } else { $reverseReads++ unless $recoverRead }
-			$validReads++ unless $recoverRead;
-			if ($matched == $cycles) {
-				if ($recoverRead) {
-					$matchedReadsRecovered++;
-				} else {
-					$matchedReads++;
+		$openedReads++ if $openedRead and not $recoverRead;
+		if ($shortRead) {
+			$shorterReads++ unless $recoverRead;
+			next;
+		} elsif ($tagString) {
+			unless ($forward) {
+				($tagString = reverse $tagString) =~ tr/ACGT/TGCA/;
+			}
+			if ($cleanDegen) {
+				$beginningSeqs{$staticSeq}{ substr($seq, 0, $staticSeqLength) }++ if $staticSeq;
+			}
+			if ($recoverRead) {
+				$recoverReads++;
+				$recoverReadCount{$recoverRead}++;
+				$recoverReadCount{$recoverRead-1}-- if $recoverRead > 1;
+			}
+			if ($mbq) {
+				if (substr($qual, $tagPosMatch, $tagsLength) =~ $lowQualRegex) {
+					$lowQualReads++ unless $recoverRead;
+					next;
 				}
-				if ($similar) {
-					foreach $errorTypePos (split ";", $similar) {
-						if ($errorTypePos) {
-							($errorType, $errorPos) = split ",", $errorTypePos;
-							$errorPos = $tagStringsErrorPos[$tagStringIndex] unless $errorPos;
-							$similarTypes{$errorType}{$errorPos}++;
-							$similarCount{$errorType}++;
+			}
+			$longer = 0;
+			$shorter = 0;
+			$similar = "";
+			$searchChimeras = 0;
+			@tagStrings = ();
+			@tagStringsErrorPos = ();
+			$tagLength = length($tagString);
+			$tagLengths{$tagLength}++;
+			if ($tagLength < $tagsLength) {
+				if ($similarTags and $tagLength == $tagsLength - 1) {
+					for ($baseno = $tagLength - 1; $baseno >= 0; $baseno--) {
+						foreach ("A", "C", "G", "T") {
+							$tempTagString = $tagString;
+							substr($tempTagString, $baseno, 1) .= $_;
+							push @tagStrings, $tempTagString;
+							push @tagStringsErrorPos, $baseno + 2;
+						}
+					}
+					foreach ("A", "C", "G", "T") {
+						push @tagStrings, $_.$tagString;
+						push @tagStringsErrorPos, 1;
+					}
+					$similar = "del";
+				} else {
+					$shorter = 1;
+				}
+			} elsif ($tagLength > $tagsLength) {
+				if ($similarTags and $tagLength == $tagsLength + 1) {
+					for ($baseno = $tagLength - 1; $baseno >= 0; $baseno--) {
+						$tempTagString = $tagString;
+						substr($tempTagString, $baseno, 1) = "";
+						push @tagStrings, $tempTagString;
+						push @tagStringsErrorPos, $baseno + 1;
+					}
+					$similar = "ins";
+				} else {
+					$longer = 1;
+					$searchChimeras = 1;
+					push @tagStrings, $tagString;
+				}
+			} else {
+				push @tagStrings, $tagString;
+			}
+			$tagStringIndex = 0;
+			TAGSTRINGS: foreach $tagString (@tagStrings) {
+				$match = "";
+				$matched = 0;
+				$chimera = 0;
+				$tagStart = 0;
+				for ($cycleIndex = 0; $cycleIndex < $cycles; $cycleIndex++) {
+					$cycle = $sortedCycles[$cycleIndex];
+					$cycleLength = $sortedCyclesLengths[$cycleIndex];
+					$tag = substr($tagString, $tagStart, $cycleLength);
+					if ($overhang = $overhangsArray[$cycleIndex]) {
+						$overhangLength = $overhangsLengths[$cycleIndex];
+						$postTag = substr($tagString, $tagStart + $cycleLength, $overhangLength);
+					} else {
+						$overhang = "";
+						$overhangLength = 0;
+						$postTag = "";
+					}
+					if ($searchChimeras) {
+						if ($tagCode = $tags{$cycle}{$tag}) {
+							$tagRepeats = $tagString =~ s/$tag$overhang//g;
+							if ($tagRepeats > 1) {
+								$chimera = 1;
+								$match .= "$tagCode-$tag*\t";
+							} else {
+								$matched++;
+								$match .= "$tagCode-$tag\t";
+							}
+						} else {
+							$match .= ".\t";
+							$tagStart += $cycleLength + $overhangLength;
+						}
+					} else {
+						unless ($similarTags) {
+							next TAGSTRINGS if $overhang ne $postTag;
+						}
+						if ($tagCode = $tags{$cycle}{$tag}) {
+							if ($checkValidTags and $similar) { next TAGSTRINGS unless exists $validTagCodesCP{$closingPrimerId}{$tagCode} }
+							$matched++;
+							$match .= "$tagCode-$tag\t";
+							$tagStart += $cycleLength + $overhangLength;
+							$matchedTags{$cycle}{$tag}++;
+						} elsif ($similarTags) {
+							$similarTagUnmatch = 1;
+							unless ($similarTagsStrict and $similar) {
+								for ($tagPos = $cycleLength - 1; $tagPos >= 0; $tagPos--) {
+									$tagPattern = $tag;
+									substr($tagPattern, $tagPos, 1) = "[ACGT]";
+									if ($cycleTags{$cycle} =~ /;($tagPattern);/) {
+										$tagCode = $tags{$cycle}{$1};
+										if ($checkValidTags) { next unless exists $validTagCodesCP{$closingPrimerId}{$tagCode} }
+										$errorPos = $tagStart + $tagPos + 1;
+										$similar .= ";var,$errorPos";
+										$matched++;
+										$match .= "$tagCode-$1\t";
+										$tagStart += $cycleLength + $overhangLength;
+										$matchedTags{$cycle}{$1}++;
+										$similarTagUnmatch = 0;
+										last;
+									}
+								}
+							}
+							if ($similarTagUnmatch) {
+								$unmatchedTags{$cycle}{$tag}++;
+								next TAGSTRINGS;
+							}
+						} else {
+							$unmatchedTags{$cycle}{$tag}++;
+							next TAGSTRINGS;
 						}
 					}
 				}
-				$matchedCPreads{$closingPrimerId}++;
-				if ( $regexN = $regexNcp{$closingPrimerId} ) {
-					$cpMatch = "$closingPrimerId;$match";
-					if ($detectDegen) {
-						if ($forward) {
-							$seq4degen = substr($seq, $tagPosMatch + $tagsLengthLow);
-						} else {
-							($seq4degen = reverse substr($seq, 0, $tagPosMatch)) =~ tr/ACGT/TGCA/;
+				last TAGSTRINGS if $matched == $cycles or $chimera;
+				$tagStringIndex++;
+			}
+			if ($chimera) {
+				$chimeraReads++ unless $recoverRead;
+				$chimeras{"$closingPrimerId;$match"}++;
+			} else {
+				if ($shorter) { $reducedReads++ unless $recoverRead; next }
+				if ($longer) { $longerReads++ unless $recoverRead; next unless $leftAnchored }
+				if ($similar) { $similarReads++ unless $recoverRead }
+				if ($forward) { $forwardReads++ unless $recoverRead } else { $reverseReads++ unless $recoverRead }
+				$validReads++ unless $recoverRead;
+				if ($matched == $cycles) {
+					if ($recoverRead) {
+						$matchedReadsRecovered++;
+					} else {
+						$matchedReads++;
+					}
+					if ($similar) {
+						foreach $errorTypePos (split ";", $similar) {
+							if ($errorTypePos) {
+								($errorType, $errorPos) = split ",", $errorTypePos;
+								$errorPos = $tagStringsErrorPos[$tagStringIndex] unless $errorPos;
+								$similarTypes{$errorType}{$errorPos}++;
+								$similarCount{$errorType}++;
+							}
 						}
-						if ($seq4degen =~ $regexN) {
-							$cpMatchesDedupStrings{$cpMatch} .= "$1;";
-							$degenCounts{$closingPrimerId}{$1}++ if $printDegen;
+					}
+					$matchedCPreads{$closingPrimerId}++;
+					if ( $regexN = $regexNcp{$closingPrimerId} ) {
+						$cpMatch = "$closingPrimerId;$match";
+						if ($detectDegen) {
+							if ($forward) {
+								$seq4degen = substr($seq, $tagPosMatch + $tagsLengthLow);
+							} else {
+								($seq4degen = reverse substr($seq, 0, $tagPosMatch)) =~ tr/ACGT/TGCA/;
+							}
+							if ($seq4degen =~ $regexN) {
+								$cpMatchesDedupStrings{$cpMatch} .= "$1;";
+								$degenCounts{$closingPrimerId}{$1}++ if $printDegen;
+							} else {
+								$undedupReads++ unless $recoverRead;
+							}
 						} else {
 							$undedupReads++ unless $recoverRead;
 						}
 					} else {
-						$undedupReads++ unless $recoverRead;
+						$cpMatch = "$noFwAnchorTag;$match";
+					}
+					$cpMatchesCounts{$cpMatch}++;
+					if ($forward) {
+						$cpMatchesStrand{$cpMatch}++;
+					} else {
+						$cpMatchesStrand{$cpMatch}--;
 					}
 				} else {
-					$cpMatch = "$noFwAnchorTag;$match";
+					$unfoundReads++ unless $recoverRead;
 				}
-				$cpMatchesCounts{$cpMatch}++;
-				if ($forward) {
-					$cpMatchesStrand{$cpMatch}++;
-				} else {
-					$cpMatchesStrand{$cpMatch}--;
-				}
-			} else {
-				$unfoundReads++ unless $recoverRead;
 			}
+		} else {
+			$invalidReads++ unless $recoverRead;
+			if ($printInvalid) { print INVALID "invalid\t$seq" unless $recoverRead }
 		}
-	} else {
-		$invalidReads++ unless $recoverRead;
-		if ($printInvalid) { print INVALID "invalid\t$seq" unless $recoverRead }
+		if ($recoveryMode and $tagPosMatch) {
+			$seq = substr($seq, $tagPosMatch + $anchoredTagsLength);
+			$qual = substr($qual, $tagPosMatch + $anchoredTagsLength);
+			$recoverRead++;
+			goto RECOVERY;
+		}
 	}
-	if ($recoveryMode and $tagPosMatch) {
-		$seq = substr($seq, $tagPosMatch + $anchoredTagsLength);
-		$qual = substr($qual, $tagPosMatch + $anchoredTagsLength);
-		$recoverRead++;
-		goto RECOVERY;
-	}
+	close FASTQ;
+	if ($printInvalid) { close INVALID }
 }
-close FASTQ;
-if ($printInvalid) { close INVALID }
 
 $elapsed = time - $start;
 print STDERR "Elapsed time post-patterns: $elapsed seconds\n";
 
-# check error rate looking at statis sequences
-if ($cleanDegen) {
+# get the number of compounds
+$cpMatchesCount = keys %cpMatchesCounts;
+
+# deal with tag lengths
+$tagLengthString = "";
+if (%tagLengths) {
+	$maxLengthCount = 0;
+	foreach $tagLength (sort {$a<=>$b} keys %tagLengths) {
+		$tagLengthCount = $tagLengths{$tagLength};
+		$tagLengthString .= "$tagLength\t$tagLengthCount\n";
+		if ($tagLengthCount > $maxLengthCount) {
+			$maxTagLength = $tagLength;
+			$maxLengthCount = $tagLengthCount;
+		}
+	}
+	$maxLengthSurround = $tagLengths{$maxTagLength - 1} + $tagLengths{$maxTagLength + 1};
+}
+
+# check error rate looking at static sequences
+if ($cleanDegen and not $fastqFiles) {
 	foreach $staticSeq (keys %beginningSeqs) {
 		$staticSeqLength = length $staticSeq;
 		foreach $beginningSeq ( keys %{ $beginningSeqs{$staticSeq} } ) {
@@ -823,150 +910,140 @@ if ($cleanDegen) {
 	}
 }
 
-# deal with tag lengths
-$maxLengthCount = 0;
-foreach $tagLength (sort {$a<=>$b} keys %tagLengths) {
-	$tagLengthCount = $tagLengths{$tagLength};
-	$tagLengthString .= "$tagLength\t$tagLengthCount\n";
-	if ($tagLengthCount > $maxLengthCount) {
-		$maxTagLength = $tagLength;
-		$maxLengthCount = $tagLengthCount;
+unless ($threaded) {
+	
+	# deal with tag lengths
+	if ($printLengths and $tagLengthString) {
+		open LENGTHS, ">$lengthsFile" or die "could not write $lengthsFile: $!";
+		print LENGTHS "#LENGTHS\tCOUNTS\n$tagLengthString";
+		close LENGTHS;
+		print STDERR "$lengthsFile\n";
 	}
-}
-$maxLengthSurround = $tagLengths{$maxTagLength - 1} + $tagLengths{$maxTagLength + 1};
-if ($printLengths) {
-	open LENGTHS, ">$lengthsFile" or die "could not write $lengthsFile: $!";
-	print LENGTHS "#LENGTHS\tCOUNTS\n$tagLengthString";
-	close LENGTHS;
-	print STDERR "$lengthsFile\n";
-}
-
-# print degen counts
-if ($printDegen) {
-	open DEGEN, "| sort -k1,1 -k3nr >$degenFile" or die "could not write $degenFile: $!";
-	print DEGEN "#CP\tDEGENSEQ\tCOUNT\n";
-	foreach $closingPrimerId (keys %degenCounts) {
-		foreach $degenSeq ( keys %{ $degenCounts{$closingPrimerId} } ) {
-			print DEGEN "$closingPrimerId\t$degenSeq\t$degenCounts{$closingPrimerId}{$degenSeq}\n";
-		}
-	}
-	close DEGEN;
-	print STDERR "$degenFile\n";
-}
-
-# print error types
-if ($printErrorTypes) {
-	open ERRORTYPE, ">$errorTypeFile" or die "could not write $errorTypeFile: $!";
-	foreach $type (sort keys %similarTypes) {
-		foreach $pos ( sort {$a<=>$b} keys %{ $similarTypes{$type} } ) {
-			print ERRORTYPE "$type\t$pos\t$similarTypes{$type}{$pos}\n";
-		}
-	}
-	close ERRORTYPE;
-	print STDERR "$errorTypeFile\n";
-}
-
-# print existing tags
-if ($existingTags and $printExistingTags) {
-	open EXISTINGTAGS, ">$existingTagsFile" or die "could not write $existingTagsFile: $!";
-	print EXISTINGTAGS $existingTags;
-	close EXISTINGTAGS;
-	print EXISTINGTAGS "$existingTagsFile\n";
-}
-
-# print recovery metrics
-if ($printRecovery) {
-	open RECOVERY, ">$recoveryFile" or die "could not write $recoveryFile: $!";
-	print RECOVERY "RECOVERY\tCOUNTS\n";
-	foreach $recoveryTime (sort {$a<=>$b} keys %recoverReadCount) {
-		print RECOVERY "$recoveryTime\t$recoverReadCount{$recoveryTime}\n" if $recoverReadCount{$recoveryTime};
-	}
-	close RECOVERY;
-	print STDERR "$recoveryFile\n";
-}
-
-# print chimeras
-if ($chimeraReads and $printChimeras) {
-	open CHIMERAS, "| sort -k" . ($cycles + 2) . "rn >$chimFile" or die "could not write $chimFile: $!";
-	foreach $cpMatch (keys %chimeras) {
-		($closingPrimerID, $match) = split ";", $cpMatch;
-		print CHIMERAS "$match$closingPrimerID\t$chimeras{$cpMatch}\n";
-	}
-	close CHIMERAS;
-	print STDERR "$chimFile\n";
-}
-
-# print raw tag counts
-if ($matchedReads and $printRawCounts) {
-	open TAGCOUNTS, "| sort -k3nr >$tagCountsFile" or die "could not open $tagCountsFile: $!";
-	foreach $cycle ( sort {$a<=>$b} keys %matchedTags ) {
-		foreach $tag ( sort keys %{ $matchedTags{$cycle} } ) {
-			print TAGCOUNTS "$cycle\t$tag\t$matchedTags{$cycle}{$tag}\t$tags{$cycle}{$tag}\t$prefix\n";
-		}
-	}
-	foreach $cycle ( sort {$a<=>$b} keys %unmatchedTags ) {
-		foreach $tag ( sort keys %{ $unmatchedTags{$cycle} } ) {
-			print TAGCOUNTS "$cycle\t$tag\t$unmatchedTags{$cycle}{$tag}\t\t$prefix\n";
-		}
-	}
-	close TAGCOUNTS;
-	print STDERR "$tagCountsFile\n";
-}
-
-# print particular tag counts
-if ($matchedReads and $tags2focus and $detectDegen) {
-	($tags2focusString = $tags2focus) =~ s/_/\t/g;
-	$tags2focusString .= "\t";
-	open DIST, "| sort -k3nr >$distFile" or die "could not write $distFile: $!";
-	foreach $closingPrimerId (sort keys %matchedCPreads) {
-		$cpString = "$closingPrimerId;$tags2focusString";
-		if ( $degenSeqs = $cpMatchesDedupStrings{$cpString} ) {
-			chop $degenSeqs;
-			%degenSeqsHash = ();
-			foreach $degenSeq (split ";", $degenSeqs) { $degenSeqsHash{$degenSeq}++ }
-			foreach $degenSeq (keys %degenSeqsHash) {
-				print DIST "$closingPrimerId\t$degenSeq\t$degenSeqsHash{$degenSeq}\n";
+	
+	# print degen counts
+	if ($printDegen) {
+		open DEGEN, "| sort -k1,1 -k3nr >$degenFile" or die "could not write $degenFile: $!";
+		print DEGEN "#CP\tDEGENSEQ\tCOUNT\n";
+		foreach $closingPrimerId (keys %degenCounts) {
+			foreach $degenSeq ( keys %{ $degenCounts{$closingPrimerId} } ) {
+				print DEGEN "$closingPrimerId\t$degenSeq\t$degenCounts{$closingPrimerId}{$degenSeq}\n";
 			}
 		}
+		close DEGEN;
+		print STDERR "$degenFile\n";
 	}
-	close DIST;
-	print STDERR "$distFile\n";
-}
 
-# get the number of compounds
-$cpMatchesCount = keys %cpMatchesCounts;
+	# print error types
+	if ($printErrorTypes) {
+		open ERRORTYPE, ">$errorTypeFile" or die "could not write $errorTypeFile: $!";
+		foreach $type (sort keys %similarTypes) {
+			foreach $pos ( sort {$a<=>$b} keys %{ $similarTypes{$type} } ) {
+				print ERRORTYPE "$type\t$pos\t$similarTypes{$type}{$pos}\n";
+			}
+		}
+		close ERRORTYPE;
+		print STDERR "$errorTypeFile\n";
+	}
 
-# look for overrepresented tags and clean degen
-if ($matchedReads) {
-	foreach $cpMatch (keys %cpMatchesCounts) {
-		$dedupCount = 1;
-		if ($cleanDegen) {
-			if ( $degenSeqs = $cpMatchesDedupStrings{$cpMatch} ) {
+	# print existing tags
+	if ($existingTags and $printExistingTags) {
+		open EXISTINGTAGS, ">$existingTagsFile" or die "could not write $existingTagsFile: $!";
+		print EXISTINGTAGS $existingTags;
+		close EXISTINGTAGS;
+		print EXISTINGTAGS "$existingTagsFile\n";
+	}
+
+	# print recovery metrics
+	if ($printRecovery) {
+		open RECOVERY, ">$recoveryFile" or die "could not write $recoveryFile: $!";
+		print RECOVERY "RECOVERY\tCOUNTS\n";
+		foreach $recoveryTime (sort {$a<=>$b} keys %recoverReadCount) {
+			print RECOVERY "$recoveryTime\t$recoverReadCount{$recoveryTime}\n" if $recoverReadCount{$recoveryTime};
+		}
+		close RECOVERY;
+		print STDERR "$recoveryFile\n";
+	}
+
+	# print chimeras
+	if ($chimeraReads and $printChimeras) {
+		open CHIMERAS, "| sort -k" . ($cycles + 2) . "rn >$chimFile" or die "could not write $chimFile: $!";
+		foreach $cpMatch (keys %chimeras) {
+			($closingPrimerID, $match) = split ";", $cpMatch;
+			print CHIMERAS "$match$closingPrimerID\t$chimeras{$cpMatch}\n";
+		}
+		close CHIMERAS;
+		print STDERR "$chimFile\n";
+	}
+
+	# print raw tag counts
+	if ($matchedReads and $printRawCounts) {
+		open TAGCOUNTS, "| sort -k3nr >$tagCountsFile" or die "could not open $tagCountsFile: $!";
+		foreach $cycle ( sort {$a<=>$b} keys %matchedTags ) {
+			foreach $tag ( sort keys %{ $matchedTags{$cycle} } ) {
+				print TAGCOUNTS "$cycle\t$tag\t$matchedTags{$cycle}{$tag}\t$tags{$cycle}{$tag}\t$prefix\n";
+			}
+		}
+		foreach $cycle ( sort {$a<=>$b} keys %unmatchedTags ) {
+			foreach $tag ( sort keys %{ $unmatchedTags{$cycle} } ) {
+				print TAGCOUNTS "$cycle\t$tag\t$unmatchedTags{$cycle}{$tag}\t\t$prefix\n";
+			}
+		}
+		close TAGCOUNTS;
+		print STDERR "$tagCountsFile\n";
+	}
+
+	# print particular tag counts
+	if ($matchedReads and $tags2focus and $detectDegen) {
+		($tags2focusString = $tags2focus) =~ s/_/\t/g;
+		$tags2focusString .= "\t";
+		open DIST, "| sort -k3nr >$distFile" or die "could not write $distFile: $!";
+		foreach $closingPrimerId (sort keys %matchedCPreads) {
+			$cpString = "$closingPrimerId;$tags2focusString";
+			if ( $degenSeqs = $cpMatchesDedupStrings{$cpString} ) {
 				chop $degenSeqs;
 				%degenSeqsHash = ();
 				foreach $degenSeq (split ";", $degenSeqs) { $degenSeqsHash{$degenSeq}++ }
-				$dedupCount = keys %degenSeqsHash;
-				if ($dedupCount < 10000) {
-					@degenSeqsArray = sort { $degenSeqsHash{$b} <=> $degenSeqsHash{$a} or $a cmp $b } keys %degenSeqsHash;
-					@degenSeqsRev = reverse @degenSeqsArray;
-					pop @degenSeqsArray;
-					pop @degenSeqsRev;
-					%degenSeqsRemoved = ();
-					foreach $degenSeq1 (@degenSeqsArray) {
-						unless ( exists $degenSeqsRemoved{$degenSeq1} ) {
-							$degenSeqLength1 = length $degenSeq1;
-							if ($degenSeqLength1 > $maxDegenErrors) {
-								for $degenError (1..$maxDegenErrors) {
-									if ( exists $beginningSeqsBaseErrors{$degenError} ) {
-										$degenSeqErrorProb = $degenSeqsHash{$degenSeq1} * $degenSeqLength1 * $beginningSeqsBaseErrors{$degenError};
-										foreach $degenSeq2 (@degenSeqsRev) {
-											unless ( exists $degenSeqsRemoved{$degenSeq2} ) {
-												if ($degenSeqsHash{$degenSeq2} < $degenSeqErrorProb) {
-													if (minSeqLD($degenSeq1, $degenSeqLength1, $degenSeq2, length $degenSeq2, $degenError) <= $degenError) {
-														$degenSeqsRemoved{$degenSeq2} = 1;
-														$dedupCount--;
-													}
-												} else { last }
+				foreach $degenSeq (keys %degenSeqsHash) {
+					print DIST "$closingPrimerId\t$degenSeq\t$degenSeqsHash{$degenSeq}\n";
+				}
+			}
+		}
+		close DIST;
+		print STDERR "$distFile\n";
+	}
+
+	# look for overrepresented tags and clean degen
+	if ($matchedReads) {
+		foreach $cpMatch (keys %cpMatchesCounts) {
+			$dedupCount = 1;
+			if ($cleanDegen) {
+				if ( $degenSeqs = $cpMatchesDedupStrings{$cpMatch} ) {
+					chop $degenSeqs;
+					%degenSeqsHash = ();
+					foreach $degenSeq (split ";", $degenSeqs) { $degenSeqsHash{$degenSeq}++ }
+					$dedupCount = keys %degenSeqsHash;
+					if ($dedupCount < 10000) {
+						@degenSeqsArray = sort { $degenSeqsHash{$b} <=> $degenSeqsHash{$a} or $a cmp $b } keys %degenSeqsHash;
+						@degenSeqsRev = reverse @degenSeqsArray;
+						pop @degenSeqsArray;
+						pop @degenSeqsRev;
+						%degenSeqsRemoved = ();
+						foreach $degenSeq1 (@degenSeqsArray) {
+							unless ( exists $degenSeqsRemoved{$degenSeq1} ) {
+								$degenSeqLength1 = length $degenSeq1;
+								if ($degenSeqLength1 > $maxDegenErrors) {
+									for $degenError (1..$maxDegenErrors) {
+										if ( exists $beginningSeqsBaseErrors{$degenError} ) {
+											$degenSeqErrorProb = $degenSeqsHash{$degenSeq1} * $degenSeqLength1 * $beginningSeqsBaseErrors{$degenError};
+											foreach $degenSeq2 (@degenSeqsRev) {
+												unless ( exists $degenSeqsRemoved{$degenSeq2} ) {
+													if ($degenSeqsHash{$degenSeq2} < $degenSeqErrorProb) {
+														if (minSeqLD($degenSeq1, $degenSeqLength1, $degenSeq2, length $degenSeq2, $degenError) <= $degenError) {
+															$degenSeqsRemoved{$degenSeq2} = 1;
+															$dedupCount--;
+														}
+													} else { last }
+												}
 											}
 										}
 									}
@@ -976,182 +1053,184 @@ if ($matchedReads) {
 					}
 				}
 			}
-		}
-		$matchCount = $cpMatchesCounts{$cpMatch};
-		$cpMatchesDedups{$cpMatch} = $dedupCount;
-		($closingPrimerId, $match) = split ";", $cpMatch;
-		if ($printOver) {
-			$countsUniq{$closingPrimerId}++;
-			$countsAverage{$closingPrimerId}{raw} += $matchCount;
-			$countsAverage{$closingPrimerId}{dedup} += $dedupCount;
-		}
-		@matchedTags = split "\t", $match;
-		for ($cycleIndex1 = 0; $cycleIndex1 <= $#matchedTags; $cycleIndex1++) {
-			($tag1 = $matchedTags[$cycleIndex1]) =~ s/.+-//;
-			$tagsFound{$closingPrimerId}{"$cycleIndex1;$tag1"} = 1;
+			$matchCount = $cpMatchesCounts{$cpMatch};
+			$cpMatchesDedups{$cpMatch} = $dedupCount;
+			($closingPrimerId, $match) = split ";", $cpMatch;
 			if ($printOver) {
-				$structuresFound{$closingPrimerId}{planes}{"$cycleIndex1;$tag1"}{raw} += $matchCount;
-				$structuresFound{$closingPrimerId}{planes}{"$cycleIndex1;$tag1"}{dedup} += $dedupCount;
-				$structuresFound{$closingPrimerId}{planes}{"$cycleIndex1;$tag1"}{unique}++;
-				for ($cycleIndex2 = $cycleIndex1 + 1; $cycleIndex2 <= $#matchedTags; $cycleIndex2++) {
-					($tag2 = $matchedTags[$cycleIndex2]) =~ s/.+-//;
-					$structuresFound{$closingPrimerId}{lines}{"$cycleIndex1;$tag1;$cycleIndex2;$tag2"}{raw} += $matchCount;
-					$structuresFound{$closingPrimerId}{lines}{"$cycleIndex1;$tag1;$cycleIndex2;$tag2"}{dedup} += $dedupCount;
-					$structuresFound{$closingPrimerId}{lines}{"$cycleIndex1;$tag1;$cycleIndex2;$tag2"}{unique}++;
+				$countsUniq{$closingPrimerId}++;
+				$countsAverage{$closingPrimerId}{raw} += $matchCount;
+				$countsAverage{$closingPrimerId}{dedup} += $dedupCount;
+			}
+			@matchedTags = split "\t", $match;
+			for ($cycleIndex1 = 0; $cycleIndex1 <= $#matchedTags; $cycleIndex1++) {
+				($tag1 = $matchedTags[$cycleIndex1]) =~ s/.+-//;
+				$tagsFound{$closingPrimerId}{"$cycleIndex1;$tag1"} = 1;
+				if ($printOver) {
+					$structuresFound{$closingPrimerId}{planes}{"$cycleIndex1;$tag1"}{raw} += $matchCount;
+					$structuresFound{$closingPrimerId}{planes}{"$cycleIndex1;$tag1"}{dedup} += $dedupCount;
+					$structuresFound{$closingPrimerId}{planes}{"$cycleIndex1;$tag1"}{unique}++;
+					for ($cycleIndex2 = $cycleIndex1 + 1; $cycleIndex2 <= $#matchedTags; $cycleIndex2++) {
+						($tag2 = $matchedTags[$cycleIndex2]) =~ s/.+-//;
+						$structuresFound{$closingPrimerId}{lines}{"$cycleIndex1;$tag1;$cycleIndex2;$tag2"}{raw} += $matchCount;
+						$structuresFound{$closingPrimerId}{lines}{"$cycleIndex1;$tag1;$cycleIndex2;$tag2"}{dedup} += $dedupCount;
+						$structuresFound{$closingPrimerId}{lines}{"$cycleIndex1;$tag1;$cycleIndex2;$tag2"}{unique}++;
+					}
 				}
 			}
 		}
-	}
-	undef %cpMatchesDedupStrings unless $threaded;
-	if ($printOver) {
-		foreach $closingPrimerId (keys %tagsFound) {
-			foreach $type ("raw", "dedup") {
-				$countsAverage{$closingPrimerId}{$type} /= $countsUniq{$closingPrimerId};
-				$tempAverage{$closingPrimerId}{$type} = $countsAverage{$closingPrimerId}{$type};
+		undef %cpMatchesDedupStrings unless $threaded;
+		if ($printOver) {
+			foreach $closingPrimerId (keys %tagsFound) {
+				foreach $type ("raw", "dedup") {
+					$countsAverage{$closingPrimerId}{$type} /= $countsUniq{$closingPrimerId};
+					$tempAverage{$closingPrimerId}{$type} = $countsAverage{$closingPrimerId}{$type};
+				}
 			}
-		}
-		foreach $cpMatch (keys %cpMatchesCounts) {
-			($closingPrimerId, $match) = split ";", $cpMatch;
-			$matchCount = $cpMatchesCounts{$cpMatch};
-			$dedupCount = $cpMatchesDedups{$cpMatch};
-			foreach $type ("raw", "dedup") {
-				if ($type eq "raw") { $tempValue = $matchCount } else { $tempValue = $dedupCount }
-				$tempStdDev{$closingPrimerId}{$type} += ( $tempAverage{$closingPrimerId}{$type} - $tempValue ) ** 2;
-				$tempCount{$closingPrimerId}{$type}++;
+			foreach $cpMatch (keys %cpMatchesCounts) {
+				($closingPrimerId, $match) = split ";", $cpMatch;
+				$matchCount = $cpMatchesCounts{$cpMatch};
+				$dedupCount = $cpMatchesDedups{$cpMatch};
+				foreach $type ("raw", "dedup") {
+					if ($type eq "raw") { $tempValue = $matchCount } else { $tempValue = $dedupCount }
+					$tempStdDev{$closingPrimerId}{$type} += ( $tempAverage{$closingPrimerId}{$type} - $tempValue ) ** 2;
+					$tempCount{$closingPrimerId}{$type}++;
+				}
 			}
-		}
-		foreach $closingPrimerId (keys %tagsFound) {
-			foreach $type ("raw", "dedup") {
-				$countsStdDev{$closingPrimerId}{$type} = sqrt( $tempStdDev{$closingPrimerId}{$type} / $tempCount{$closingPrimerId}{$type} );
+			foreach $closingPrimerId (keys %tagsFound) {
+				foreach $type ("raw", "dedup") {
+					$countsStdDev{$closingPrimerId}{$type} = sqrt( $tempStdDev{$closingPrimerId}{$type} / $tempCount{$closingPrimerId}{$type} );
+				}
 			}
-		}
-		open OVER, ">$overTagsFile" or die "could not open $overTagsFile: $!";
-		print OVER "#TYPE\tCOUNT\tSDCOUNT\tCP\tTAGS\n";
-		foreach $type (@tagsOverTypes) {
-			foreach $closingPrimerId (keys %structuresFound) {
-				foreach $structure ("planes", "lines") {
-					$cpCycleTagInfo = $structuresFound{$closingPrimerId}{$structure};
-					@cpCycleTags = keys %$cpCycleTagInfo;
-					$cpCycleTagStdDev = 0;
-					$cpCycleTagCount = 0;
-					$cpCycleTagAverage = 0;
-					foreach $cpCycleTag (@cpCycleTags) {
-						$cpCycleTagCount++;
-						$cpCycleTagAverage += $cpCycleTagInfo->{$cpCycleTag}{$type};
-					}
-					$cpCycleTagAverage /= $cpCycleTagCount;
-					foreach $cpCycleTag (@cpCycleTags) {
-						$cpCycleTagStdDev += ( $cpCycleTagAverage - $cpCycleTagInfo->{$cpCycleTag}{$type} ) ** 2;
-					}
-					$cpCycleTagStdDev = sqrt($cpCycleTagStdDev / $cpCycleTagCount);
-					$cpCycleTagThreshold = $cpCycleTagAverage + $cpCycleTagStdDev;
-					foreach $cpCycleTag (@cpCycleTags) {
-						$tempValue = $cpCycleTagInfo->{$cpCycleTag}{$type};
-						if ($tempValue > $cpCycleTagThreshold) {
-							($cycleIndex1, $tag1, $cycleIndex2, $tag2) = split ";", $cpCycleTag;
-							$tag1Code = $tags{ $sortedCycles[$cycleIndex1] }{$tag1};
-							if ($tag2) {
-								$tag2Code = $tags{ $sortedCycles[$cycleIndex2] }{$tag2};
-								$tagCodeTag = "$tag1Code-$tag1;$tag2Code-$tag2";
-							} else {
-								$tagCodeTag = "$tag1Code-$tag1";
+			open OVER, ">$overTagsFile" or die "could not open $overTagsFile: $!";
+			print OVER "#TYPE\tCOUNT\tSDCOUNT\tCP\tTAGS\n";
+			foreach $type (@tagsOverTypes) {
+				foreach $closingPrimerId (keys %structuresFound) {
+					foreach $structure ("planes", "lines") {
+						$cpCycleTagInfo = $structuresFound{$closingPrimerId}{$structure};
+						@cpCycleTags = keys %$cpCycleTagInfo;
+						$cpCycleTagStdDev = 0;
+						$cpCycleTagCount = 0;
+						$cpCycleTagAverage = 0;
+						foreach $cpCycleTag (@cpCycleTags) {
+							$cpCycleTagCount++;
+							$cpCycleTagAverage += $cpCycleTagInfo->{$cpCycleTag}{$type};
+						}
+						$cpCycleTagAverage /= $cpCycleTagCount;
+						foreach $cpCycleTag (@cpCycleTags) {
+							$cpCycleTagStdDev += ( $cpCycleTagAverage - $cpCycleTagInfo->{$cpCycleTag}{$type} ) ** 2;
+						}
+						$cpCycleTagStdDev = sqrt($cpCycleTagStdDev / $cpCycleTagCount);
+						$cpCycleTagThreshold = $cpCycleTagAverage + $cpCycleTagStdDev;
+						foreach $cpCycleTag (@cpCycleTags) {
+							$tempValue = $cpCycleTagInfo->{$cpCycleTag}{$type};
+							if ($tempValue > $cpCycleTagThreshold) {
+								($cycleIndex1, $tag1, $cycleIndex2, $tag2) = split ";", $cpCycleTag;
+								$tag1Code = $tags{ $sortedCycles[$cycleIndex1] }{$tag1};
+								if ($tag2) {
+									$tag2Code = $tags{ $sortedCycles[$cycleIndex2] }{$tag2};
+									$tagCodeTag = "$tag1Code-$tag1;$tag2Code-$tag2";
+								} else {
+									$tagCodeTag = "$tag1Code-$tag1";
+								}
+								$tempCount = 1;
+								$tempStdDev = $cpCycleTagThreshold + $cpCycleTagStdDev;
+								while ($tempValue > $tempStdDev) {
+									$tempCount++;
+									$tempStdDev += $cpCycleTagStdDev;
+								}
+								$tagsOver{$closingPrimerId}{$type}{$tagCodeTag} = $tempCount;
+								print OVER "$type\t$tempValue\t$tempCount\t$closingPrimerId\t$tagCodeTag\n"
 							}
-							$tempCount = 1;
-							$tempStdDev = $cpCycleTagThreshold + $cpCycleTagStdDev;
-							while ($tempValue > $tempStdDev) {
-								$tempCount++;
-								$tempStdDev += $cpCycleTagStdDev;
-							}
-							$tagsOver{$closingPrimerId}{$type}{$tagCodeTag} = $tempCount;
-							print OVER "$type\t$tempValue\t$tempCount\t$closingPrimerId\t$tagCodeTag\n"
 						}
 					}
 				}
 			}
-		}
-		foreach $cpMatch (keys %cpMatchesCounts) {
-			($closingPrimerId, $match) = split ";", $cpMatch;
-			$matchCount = $cpMatchesCounts{$cpMatch};
-			$dedupCount = $cpMatchesDedups{$cpMatch};
-			$sdString = "";
-			foreach $type ("raw", "dedup") {
-				if ($type eq "raw") {
-					$tempValue = $matchCount;
-				} else {
-					$tempValue = $dedupCount;
+			foreach $cpMatch (keys %cpMatchesCounts) {
+				($closingPrimerId, $match) = split ";", $cpMatch;
+				$matchCount = $cpMatchesCounts{$cpMatch};
+				$dedupCount = $cpMatchesDedups{$cpMatch};
+				$sdString = "";
+				foreach $type ("raw", "dedup") {
+					if ($type eq "raw") {
+						$tempValue = $matchCount;
+					} else {
+						$tempValue = $dedupCount;
+					}
+					$tempCount = 0;
+					while ($tempValue > $countsAverage{$closingPrimerId}{$type} + ($tempCount + 1) * $countsStdDev{$closingPrimerId}{$type} ) { $tempCount++ }
+					$sdString .= "\t$tempCount";
+					if ($tempCount) {
+						chop $match;
+						$match =~ s/\t/;/g;
+						print OVER "$type\t$tempValue\t$tempCount\t$closingPrimerId\t$match\n";
+					}
 				}
-				$tempCount = 0;
-				while ($tempValue > $countsAverage{$closingPrimerId}{$type} + ($tempCount + 1) * $countsStdDev{$closingPrimerId}{$type} ) { $tempCount++ }
-				$sdString .= "\t$tempCount";
-				if ($tempCount) {
-					chop $match;
-					$match =~ s/\t/;/g;
-					print OVER "$type\t$tempValue\t$tempCount\t$closingPrimerId\t$match\n";
-				}
+				$cpMatchesSD{$cpMatch} = $sdString;
 			}
-			$cpMatchesSD{$cpMatch} = $sdString;
+			close OVER;
+			if ($cpMatchesCount < $outSortLimit) {
+				system "head -n1 $overTagsFile > $overTagsFile.sortTemp";
+				system "tail -n +2 $overTagsFile | sort -k1,1 -k3,3nr -k4,4V -k3,3nr >> $overTagsFile.sortTemp";
+				rename "$overTagsFile.sortTemp", $overTagsFile;
+			}
+			print STDERR "$overTagsFile\n";
 		}
-		close OVER;
-		if ($cpMatchesCount < $outSortLimit) {
-			system "sort -k1,1 -k3,3nr -k4,4V -k3,3nr $overTagsFile > $overTagsFile.sortTemp";
-			rename "$overTagsFile.sortTemp", $overTagsFile;
-		}
-		print STDERR "$overTagsFile\n";
 	}
-}
 
-# print expected tags
-if ($matchedReads and $checkValidTags) {
-	if ($printExpected) {
-		open EXPECTED, ">$expectedFile" or die "could not open $expectedFile: $!";
-	}
-	for ($cycleIndex = 0; $cycleIndex <= $#sortedCycles; $cycleIndex++) {
-		$cycle = $sortedCycles[$cycleIndex];
-		foreach $tag ( keys %{ $tags{$cycle} } ) {
-			$tagCode = $tags{$cycle}{$tag};
-			print EXPECTED "$tagCode\t$tag" if $printExpected;
+	# print expected tags
+	if ($matchedReads and $checkValidTags) {
+		if ($printExpected) {
+			open EXPECTED, ">$expectedFile" or die "could not open $expectedFile: $!";
+		}
+		for ($cycleIndex = 0; $cycleIndex <= $#sortedCycles; $cycleIndex++) {
+			$cycle = $sortedCycles[$cycleIndex];
+			foreach $tag ( keys %{ $tags{$cycle} } ) {
+				$tagCode = $tags{$cycle}{$tag};
+				print EXPECTED "$tagCode\t$tag" if $printExpected;
+				foreach $closingPrimerId (sort keys %matchedCPreads) {
+					$tagFlag = $validTagCodesCP{$closingPrimerId}{$tagCode} ? 1 : 0;
+					if ( exists $tagsFound{$closingPrimerId}{"$cycleIndex;$tag"} ) {
+						$tagFlag = "+" . $tagFlag;
+						$tagsFoundCount++;
+					} else {
+						$idTagsMissing{$closingPrimerId}{$cycleIndex}{"$tagCode-$tag"} = 1;
+						$tagFlag = "-" . $tagFlag;
+						$tagsMissingCount++;
+					}
+					print EXPECTED "\t$tagFlag" if $printExpected;
+				}
+				print EXPECTED "\n" if $printExpected;
+			}
+		}
+		if ($tagsMissingCount > $tagsFoundCount) { $filterMatches = 1 }
+		if ($printExpected) {
+			close EXPECTED;
+			open EXPECTED, ">$expectedFile.temp" or die "could not open $expectedFile.temp: $!";
+			print EXPECTED "ID\tTAG";
 			foreach $closingPrimerId (sort keys %matchedCPreads) {
-				$tagFlag = $validTagCodesCP{$closingPrimerId}{$tagCode} ? 1 : 0;
-				if ( exists $tagsFound{$closingPrimerId}{"$cycleIndex;$tag"} ) {
-					$tagFlag = "+" . $tagFlag;
-					$tagsFoundCount++;
-				} else {
-					$idTagsMissing{$closingPrimerId}{$cycleIndex}{"$tagCode-$tag"} = 1;
-					$tagFlag = "-" . $tagFlag;
-					$tagsMissingCount++;
-				}
-				print EXPECTED "\t$tagFlag" if $printExpected;
+				$closingPrimerHeader = $closingPrimerId ? $closingPrimerId : "EMPTY";
+				print EXPECTED "\t$closingPrimerHeader";
 			}
-			print EXPECTED "\n" if $printExpected;
-		}
-	}
-	if ($tagsMissingCount > $tagsFoundCount) { $filterMatches = 1 }
-	if ($printExpected) {
-		close EXPECTED;
-		open EXPECTED, ">$expectedFile.temp" or die "could not open $expectedFile.temp: $!";
-		print EXPECTED "ID\tTAG";
-		foreach $closingPrimerId (sort keys %matchedCPreads) {
-			$closingPrimerHeader = $closingPrimerId ? $closingPrimerId : "EMPTY";
-			print EXPECTED "\t$closingPrimerHeader";
-		}
-		print EXPECTED "\n";
-		close EXPECTED;
-		if ($cpMatchesCount < $outSortLimit) {
-			system "sort -k1n $expectedFile >> $expectedFile.temp";
-			rename "$expectedFile.temp", $expectedFile;
+			print EXPECTED "\n";
+			close EXPECTED;
+			if ($cpMatchesCount < $outSortLimit) {
+				system "sort -k1n $expectedFile >> $expectedFile.temp";
+				rename "$expectedFile.temp", $expectedFile;
+			} else {
+				system "cat $expectedFile.temp $expectedFile > $expectedFile.temp2";
+				rename "$expectedFile.temp2", $expectedFile;
+				unlink "$expectedFile.temp";
+			}
+			print STDERR "$expectedFile\n";
 		} else {
-			system "cat $expectedFile.temp $expectedFile > $expectedFile.temp2";
-			rename "$expectedFile.temp2", $expectedFile;
-			unlink "$expectedFile.temp";
+			unlink $expectedFile;
 		}
-		print STDERR "$expectedFile\n";
-	} else {
-		unlink $expectedFile;
 	}
-}
 
-$elapsed = time - $start;
-print STDERR "Elapsed time pre-printing: $elapsed seconds\n";
+	$elapsed = time - $start;
+	print STDERR "Elapsed time pre-printing: $elapsed seconds\n";
+	
+}
 
 # deal with matches
 if ($matchedReads) {
@@ -1161,7 +1240,7 @@ if ($matchedReads) {
 	if ($filterMatches) {
 		open MATCHES2, ">$txtFileDWfilter" or die "could not write $txtFileDWfilter: $!";
 	}
-	if ($directWrite) {
+	if ($directWrite and not $threaded) {
 		print MATCHES $dwheader; print MATCHES $myheader;
 		if ($filterMatches) {
 			print MATCHES2 $dwheader; print MATCHES2 $myheader;
@@ -1177,9 +1256,13 @@ if ($matchedReads) {
 	foreach $cpMatch (keys %cpMatchesCounts) {
 		($closingPrimerId, $match) = split ";", $cpMatch;
 		$matchCount = $cpMatchesCounts{$cpMatch};
-		$dedupCount = $cpMatchesDedups{$cpMatch};
-		$strandCount = sprintf( "%.3f", abs( $cpMatchesStrand{$cpMatch} / $matchCount ) );
+		unless ( $dedupCount = $cpMatchesDedups{$cpMatch} ) { $dedupCount = 1 }
 		$dedupedReads += $dedupCount;
+		if ($threaded) {
+			$strandCount = $cpMatchesStrand{$cpMatch};
+		} else {
+			$strandCount = sprintf( "%.3f", abs( $cpMatchesStrand{$cpMatch} / $matchCount ) );
+		}
 		$cpLibrarySizeNorm = $librarySizeNorm{$closingPrimerId};
 		if ($checkValidTags) {
 			$expected = 1;
@@ -1203,14 +1286,12 @@ if ($matchedReads) {
 			$nonexpectedDedupMatchCounts{$closingPrimerId} += $dedupCount;
 		}
 		if ($threaded) {
-			$degenSeqs = $cpMatchesDedupStrings{$cpMatch};
-			chop $degenSeqs;
-			if ($filterMatches) {
-				$outLine = "$match$closingPrimerId\t$matchCount\t$expected\t$degenSeqs\n";
-				print MATCHES $outLine; print MATCHES2 $outLine;
+			if ( $degenSeqs = $cpMatchesDedupStrings{$cpMatch} ) {
+				chop $degenSeqs;
 			} else {
-				print MATCHES "$match$closingPrimerId\t$matchCount\t$expected\t$degenSeqs\n";
+				$degenSeqs = "";
 			}
+			print MATCHES "$match,$closingPrimerId,$matchCount,$strandCount,$degenSeqs,\n";
 		} else {
 			if ($printOver) {
 				$overTagString = $cpMatchesSD{$cpMatch};
@@ -1259,7 +1340,7 @@ if ($matchedReads) {
 		}
 	}
 	if ($filterMatches) {
-		if ($directWrite) { print MATCHES2 $dwfooter }
+		if ($directWrite and not $threaded) { print MATCHES2 $dwfooter }
 		close MATCHES2;
 	}
 	foreach $closingPrimerId (sort keys %idTagsMissing) {
@@ -1278,7 +1359,7 @@ if ($matchedReads) {
 			}
 		}
 	}
-	if ($directWrite) { print MATCHES $dwfooter }
+	if ($directWrite and not $threaded) { print MATCHES $dwfooter }
 	close MATCHES;
 	unless ($threaded) {
 		unless ($directWrite) {
@@ -1371,7 +1452,7 @@ if ($totalReads) {
 	print STATS "\n";
 	print STATS "Running time: $end seconds\n";
 	close STATS;
-	print STDERR "$logFile\n";
+	print STDERR "$logFile\n" unless $threaded;
 	print STDERR "Total running time: $end seconds\n" unless $threaded;
 }
 
@@ -1463,7 +1544,7 @@ sub printHeaderFooter {
 	return $myheader, $dwheader, $dwfooter;
 }
 
-sub splitJoin {
+sub split_and_fork {
 	my ($fastqFile, $prefix, $threads) = @_;
 	$start = time;
 	$maxThreads = `getconf _NPROCESSORS_ONLN`; # or `nproc --all`, or `grep -c ^processor /proc/cpuinfo`
@@ -1483,15 +1564,19 @@ sub splitJoin {
 		push @filehandles, *FH;
 	}
 	while ($lines = <FASTQ>) {
-		$totalReads++;
+		$reads2split++;
 		for (1..3) { $lines .= <FASTQ> }
-		$filehandle = $filehandles[$totalReads % $threads];
+		$filehandle = $filehandles[$reads2split % $threads];
 		print $filehandle $lines;
 	}
 	close FASTQ;
 	foreach $filehandle (@filehandles) { close $filehandle }
 	$elapsed = time - $start;
 	print STDERR "Elapsed time post-split: $elapsed seconds\n";
+	
+	# use Cwd 'abs_path';
+	# use File::Basename;
+	# use lib dirname( abs_path $0 );
 	# use Parallel::ForkManager;
 	# $pm = new Parallel::ForkManager($threads);
 	foreach $splitFile (@splitFiles) {
@@ -1503,14 +1588,7 @@ sub splitJoin {
 		# $pm->finish;
 	}
 	# $pm->wait_all_children;
-	# foreach (@splitFiles) { print $forkResults{$_} }
 	waitpid($_,0) for @pids;
-	foreach (@splitFiles) { unlink }
-	foreach (< tags_$prefix.*.log >) { unlink }
-	foreach (< tags_$prefix.*.dwar >) { unlink }
-	$end = time - $start;
-	print STDERR "Total running time: $end seconds\n";
-	exit;
 }
 
 # http://www.perlmonks.org/?node=Levenshtein%20distance%3A%20calculating%20similarity%20of%20strings

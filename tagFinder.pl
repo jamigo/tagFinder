@@ -145,6 +145,7 @@ if ($fastqFile =~ /([^\/]+)\.[fastq]+(\.gz)?(\.(\d+))?/i) {
 	$prefix =~ s/\.unaligned//;
 	$prefix =~ s/\.aligned//;
 	$prefix =~ s/.+user_(XEN|MX)-+\d+-//;
+	$prefix =~ s/_S\d+_R\d_001//;
 	print STDERR "$prefix\n";
 } else {
 	die "could not find a valid prefix in $fastqFile";
@@ -902,9 +903,9 @@ if ($fastqFiles) {
 			my $match = "";
 			my $matched = 0;
 			my $chimera = 0;
-			my $tagStart = 0;
 			my $tagStringIndex = 0;
 			TAGSTRINGS: foreach my $tagString (@tagStrings) {
+				my $tagStart = 0;
 				for (my $cycleIndex = 0; $cycleIndex < $cycles; $cycleIndex++) {
 					my $cycle = $sortedCycles[$cycleIndex];
 					my $cycleLength = $sortedCyclesLengths[$cycleIndex];
